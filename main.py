@@ -1,36 +1,28 @@
-import os, time, requests
-from flask import Flask
+import os
 import threading
+from flask import Flask
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+TOKEN = os.environ.get("BOT_TOKEN")
 
 app = Flask(__name__)
 @app.route('/')
-def health():
-    return "Bot activo - OK"
+def home():
+    return "Bot Leo esta vivo!"
 
-def run_web():
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Bot activo! Tu ID es: {update.effective_user.id}")
 
-threading.Thread(target=run_web, daemon=True).start()
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
 
-TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+def run_bot():
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.run_polling()
 
-def send(t):
-    try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": t}, timeout=10)
-    except:
-        pass
-
-print("Bot iniciado")
-offset=0
-while True:
-    try:
-        r=requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates", params={"offset": offset, "timeout":20}, timeout=25).json()
-        for u in r.get("result", []):
-            offset=u["update_id"]+1
-            txt=u.get("message",{}).get("text","")
-            cid=u.get("message",{}).get("chat",{}).get("id")
-            if "/start" in txt.lower(): send(f"Bot activo! ID: {cid}")
-    except:
-        time.sleep(5)
-    time.sleep(2)
+if __name__ == "__main__":
+    threading.Thread(target=run_flask).start()
+    run_bot()
