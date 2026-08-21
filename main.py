@@ -21,7 +21,7 @@ def send(msg):
 
 def get_data(symbol, interval):
     try:
-        url = f"url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit=100"
+        url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
         d = requests.get(url, timeout=10).json()
         closes = [float(x[4]) for x in d]
         highs = [float(x[2]) for x in d]
