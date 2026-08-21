@@ -1,9 +1,15 @@
+from flask import Flask
+import threading
+app = Flask(__name__)
+@app.route('/')
+def home(): return "Bot ON"
+threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000)).start()
 import requests
 import time
 from datetime import datetime
 
-TOKEN = "ACA VA TU TOKEN DE TELEGRAM"
-CHAT_ID = "ACA VA TU CHAT_ID"
+TOKEN = "8746064456:AAGTiH-yfpwPwwjFTmqLuw4Z2-wg--eks-M"
+CHAT_ID = "8898482159"
 MIN_GANANCIA = 1.5
 TIMEFRAMES = ["5m","15m","1h","4h","1d"]
 
@@ -15,7 +21,7 @@ def send(msg):
 
 def get_data(symbol, interval):
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100"
+        url = f"url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit=100"
         d = requests.get(url, timeout=10).json()
         closes = [float(x[4]) for x in d]
         highs = [float(x[2]) for x in d]
