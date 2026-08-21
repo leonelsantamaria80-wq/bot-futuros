@@ -24,9 +24,8 @@ def run_bot():
     asyncio.set_event_loop(asyncio.new_event_loop())
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.run_polling()
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    # Flask va en hilo secundario
     threading.Thread(target=run_flask, daemon=True).start()
     run_bot()
