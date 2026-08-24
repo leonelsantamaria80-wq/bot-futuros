@@ -1,896 +1,2518 @@
-import requests
+import os
 import time
 import threading
+import requests
 from flask import Flask
 
 # ============================================================
-# CONFIGURACIÓN
+# BOT FUTUROS CRYPTO - SEÑALES TELEGRAM
+# ============================================================
+#
+# IMPORTANTE:
+# Este bot NO ejecuta operaciones.
+# Solamente analiza el mercado y manda señales a Telegram.
+#
+# Mercado:
+# Binance USDⓈ-M Futures
+#
+# Temporalidades:
+# 1D / 4H / 1H / 15M / 5M
+#
 # ============================================================
 
-TOKEN = "8746064456:AAGTiH-yfpwPwwjFTmqLuw4Z2-wg--eks-M"
-CHAT_ID = "8898482159"
-
-# Ganancia mínima que queremos obtener SOBRE EL MARGEN
-MIN_GANANCIA_NETA = 1.5
-
-# Comisión estimada por cada lado de la operación.
-# EJEMPLO: 0.05% entrada + 0.05% salida = 0.10% total.
-# CAMBIALA según la comisión real que tengas en Binance.
-COMISION_POR_LADO = 0.05
-
-# Apalancamiento
-MIN_APALANCAMIENTO = 5
-MAX_APALANCAMIENTO = 10
-
-# Temporalidades
-TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"]
 
 # ============================================================
-# MONEDAS
+# CONFIGURACION
 # ============================================================
 
-MONEDAS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "SOLUSDT",
-    "XRPUSDT",
-    "ADAUSDT",
-    "DOGEUSDT",
-    "SHIBUSDT",
-    "AVAXUSDT",
-    "DOTUSDT",
-    "LINKUSDT",
-    "LTCUSDT",
-    "MATICUSDT",
-    "TRXUSDT",
-    "UNIUSDT",
-    "ATOMUSDT",
-    "ETCUSDT",
-    "FILUSDT",
-    "XLMUSDT",
-    "HBARUSDT",
-    "NEARUSDT",
-    "APTUSDT",
-    "ARBUSDT",
-    "OPUSDT",
-    "INJUSDT",
-    "RNDRUSDT",
-    "PEPEUSDT",
-    "SUIUSDT",
-    "TIAUSDT",
-    "SEIUSDT",
-    "WIFUSDT",
-    "BONKUSDT",
-    "FLOKIUSDT",
-    "JUPUSDT",
-    "ENAUSDT",
-    "WUSDT",
-    "PYTHUSDT",
-    "STRKUSDT",
-    "LDOUSDT",
-    "STXUSDT"
-]
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ============================================================
-# FLASK
-# ============================================================
+BINANCE_URL = "https://fapi.binance.com"
 
 app = Flask(__name__)
 
-# Guarda la última señal enviada de cada moneda.
-# Ejemplo:
-# BTCUSDT = LONG
-#
-# De esta forma no manda LONG, LONG, LONG cada 3 minutos.
-ultima_senal_enviada = {}
+session = requests.Session()
+
+
+# ============================================================
+# PARAMETROS DEL BOT
+# ============================================================
+
+TOTAL_MONEDAS = 50
+
+MONEDAS_BAJA_VOLATILIDAD = 40
+MONEDAS_ALTA_VOLATILIDAD = 10
+
+INTERVALO_ANALISIS = 180
+
+MIN_SCORE = 7
+
+MIN_LEVERAGE = 5
+MAX_LEVERAGE = 10
+
+MIN_GANANCIA_NETA = 1.50
+
+# Estimación de comisión entrada + salida.
+# Se puede modificar posteriormente según tu comisión real.
+COMISION_TOTAL = 0.10
+
+# Distancia máxima aproximada para enviar prealerta.
+PREALERTA_ATR = 1.50
+
+# ============================================================
+# CONTROL DE SEÑALES REPETIDAS
+# ============================================================
+
+señales_activas = {}
+
+señales_lock = threading.Lock()
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def send(msg):
+def enviar_telegram(mensaje):
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+
+        print("Telegram no configurado.")
+
+        return False
+
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+
+        url = (
+            "https://api.telegram.org/bot"
+            + TELEGRAM_TOKEN
+            + "/sendMessage"
+        )
+
+        respuesta = session.post(
+            url,
             json={
-                "chat_id": CHAT_ID,
-                "text": msg
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": mensaje
             },
             timeout=15
         )
-    except Exception as e:
-        print("Error Telegram:", e)
-
-
-# ============================================================
-# DATOS BINANCE
-# ============================================================
-
-def get_data(symbol, interval):
-    try:
-        url = (
-            "https://data-api.binance.vision/api/v3/klines"
-            f"?symbol={symbol}&interval={interval}&limit=100"
-        )
-
-        respuesta = requests.get(url, timeout=10)
 
         if respuesta.status_code != 200:
-            return None, None, None, None
 
-        d = respuesta.json()
+            print(
+                "Error Telegram:",
+                respuesta.text
+            )
 
-        if not isinstance(d, list) or len(d) < 50:
-            return None, None, None, None
+            return False
 
-        closes = [float(x[4]) for x in d]
-        highs = [float(x[2]) for x in d]
-        lows = [float(x[3]) for x in d]
-        vols = [float(x[5]) for x in d]
-
-        return closes, highs, lows, vols
+        return True
 
     except Exception as e:
-        print("Error datos", symbol, interval, e)
-        return None, None, None, None
+
+        print(
+            "Error enviando Telegram:",
+            e
+        )
+
+        return False
+
+
+# ============================================================
+# BINANCE REQUEST
+# ============================================================
+
+def binance_get(endpoint, params=None):
+
+    try:
+
+        respuesta = session.get(
+            BINANCE_URL + endpoint,
+            params=params,
+            timeout=10
+        )
+
+        if respuesta.status_code != 200:
+
+            print(
+                "Error Binance:",
+                respuesta.status_code,
+                endpoint
+            )
+
+            return None
+
+        return respuesta.json()
+
+    except Exception as e:
+
+        print(
+            "Error conexión Binance:",
+            e
+        )
+
+        return None
+
+
+# ============================================================
+# CONTRATOS DISPONIBLES
+# ============================================================
+
+def obtener_contratos():
+
+    data = binance_get(
+        "/fapi/v1/exchangeInfo"
+    )
+
+    if not data:
+
+        return []
+
+    resultado = []
+
+    for item in data.get("symbols", []):
+
+        try:
+
+            if item.get("status") != "TRADING":
+                continue
+
+            if item.get("contractType") != "PERPETUAL":
+                continue
+
+            if item.get("quoteAsset") != "USDT":
+                continue
+
+            symbol = item.get("symbol")
+
+            if symbol and symbol.endswith("USDT"):
+
+                resultado.append(symbol)
+
+        except Exception:
+
+            continue
+
+    return resultado
+
+
+# ============================================================
+# VOLUMEN 24 HORAS
+# ============================================================
+
+def obtener_volumenes():
+
+    data = binance_get(
+        "/fapi/v1/ticker/24hr"
+    )
+
+    if not data:
+
+        return {}
+
+    resultado = {}
+
+    for item in data:
+
+        try:
+
+            symbol = item.get("symbol")
+
+            if not symbol:
+                continue
+
+            if not symbol.endswith("USDT"):
+                continue
+
+            volumen = float(
+                item.get("quoteVolume", 0)
+            )
+
+            resultado[symbol] = volumen
+
+        except Exception:
+
+            continue
+
+    return resultado
+
+
+# ============================================================
+# KLINES
+# ============================================================
+
+def obtener_velas(
+    symbol,
+    timeframe,
+    limit=120
+):
+
+    data = binance_get(
+        "/fapi/v1/klines",
+        {
+            "symbol": symbol,
+            "interval": timeframe,
+            "limit": limit
+        }
+    )
+
+    if not data:
+        return None
+
+    velas = []
+
+    try:
+
+        for x in data:
+
+            velas.append(
+                {
+                    "open": float(x[1]),
+                    "high": float(x[2]),
+                    "low": float(x[3]),
+                    "close": float(x[4]),
+                    "volume": float(x[5])
+                }
+            )
+
+        return velas
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# PRECIO MARK
+# ============================================================
+
+def obtener_mark_price(symbol):
+
+    data = binance_get(
+        "/fapi/v1/premiumIndex",
+        {
+            "symbol": symbol
+        }
+    )
+
+    if not data:
+
+        return None
+
+    try:
+
+        return float(
+            data["markPrice"]
+        )
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# OPEN INTEREST
+# ============================================================
+
+def obtener_open_interest(symbol):
+
+    data = binance_get(
+        "/fapi/v1/openInterest",
+        {
+            "symbol": symbol
+        }
+    )
+
+    if not data:
+
+        return None
+
+    try:
+
+        return float(
+            data["openInterest"]
+        )
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# FUNDING RATE
+# ============================================================
+
+def obtener_funding(symbol):
+
+    data = binance_get(
+        "/fapi/v1/premiumIndex",
+        {
+            "symbol": symbol
+        }
+    )
+
+    if not data:
+
+        return None
+
+    try:
+
+        return float(
+            data["lastFundingRate"]
+        ) * 100
+
+    except Exception:
+
+        return None
 
 
 # ============================================================
 # EMA
 # ============================================================
 
-def ema(arr, p):
-    if not arr:
-        return 0
+def calcular_ema(valores, periodo):
 
-    k = 2 / (p + 1)
-    e = arr[0]
+    if len(valores) < periodo:
 
-    for x in arr[1:]:
-        e = x * k + e * (1 - k)
+        return None
 
-    return e
+    k = 2 / (periodo + 1)
+
+    resultado = valores[0]
+
+    for valor in valores[1:]:
+
+        resultado = (
+            valor * k
+            + resultado * (1 - k)
+        )
+
+    return resultado
 
 
-def calc_ema_list(arr, p):
-    if not arr:
+def calcular_ema_series(valores, periodo):
+
+    if not valores:
+
         return []
 
-    k = 2 / (p + 1)
+    k = 2 / (periodo + 1)
 
-    lista = [arr[0]]
+    resultado = [valores[0]]
 
-    for x in arr[1:]:
-        lista.append(x * k + lista[-1] * (1 - k))
+    for valor in valores[1:]:
 
-    return lista
+        resultado.append(
+            valor * k
+            + resultado[-1] * (1 - k)
+        )
+
+    return resultado
 
 
 # ============================================================
 # RSI
 # ============================================================
 
-def calc_rsi(closes, period=14):
+def calcular_rsi(
+    cierres,
+    periodo=14
+):
 
-    if len(closes) < period + 1:
+    if len(cierres) < periodo + 1:
+
         return 50
 
-    gains = 0
-    losses = 0
+    ganancias = []
+    perdidas = []
 
-    for i in range(-period, 0):
+    for i in range(1, len(cierres)):
 
-        d = closes[i] - closes[i - 1]
+        cambio = (
+            cierres[i]
+            - cierres[i - 1]
+        )
 
-        if d > 0:
-            gains += d
+        if cambio > 0:
+
+            ganancias.append(cambio)
+            perdidas.append(0)
+
         else:
-            losses -= d
 
-    if losses == 0:
+            ganancias.append(0)
+            perdidas.append(abs(cambio))
+
+    promedio_ganancia = (
+        sum(ganancias[-periodo:])
+        / periodo
+    )
+
+    promedio_perdida = (
+        sum(perdidas[-periodo:])
+        / periodo
+    )
+
+    if promedio_perdida == 0:
+
         return 100
 
-    rs = gains / losses
+    rs = (
+        promedio_ganancia
+        / promedio_perdida
+    )
 
-    return 100 - (100 / (1 + rs))
+    return 100 - (
+        100 / (1 + rs)
+    )
 
 
 # ============================================================
 # MACD
 # ============================================================
 
-def calc_macd(closes):
+def calcular_macd(cierres):
 
-    if len(closes) < 35:
+    if len(cierres) < 35:
+
         return 0, 0
 
-    e12 = calc_ema_list(closes, 12)
-    e26 = calc_ema_list(closes, 26)
+    ema12 = calcular_ema_series(
+        cierres,
+        12
+    )
 
-    macd = [
-        a - b
-        for a, b in zip(e12, e26)
-    ]
+    ema26 = calcular_ema_series(
+        cierres,
+        26
+    )
 
-    sig = calc_ema_list(macd, 9)
+    linea_macd = []
 
-    return macd[-1], sig[-1]
+    for a, b in zip(
+        ema12,
+        ema26
+    ):
+
+        linea_macd.append(
+            a - b
+        )
+
+    señal = calcular_ema_series(
+        linea_macd,
+        9
+    )
+
+    return (
+        linea_macd[-1],
+        señal[-1]
+    )
 
 
 # ============================================================
 # ATR
 # ============================================================
 
-def calc_atr(highs, lows, closes, period=14):
+def calcular_atr(
+    velas,
+    periodo=14
+):
 
-    if len(closes) < period + 1:
-        return 0
+    if len(velas) < periodo + 2:
 
-    trs = []
+        return None
 
-    for i in range(1, len(closes)):
+    tr = []
 
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1])
+    for i in range(
+        1,
+        len(velas)
+    ):
+
+        actual = velas[i]
+
+        anterior = velas[i - 1]
+
+        rango = max(
+            actual["high"]
+            - actual["low"],
+
+            abs(
+                actual["high"]
+                - anterior["close"]
+            ),
+
+            abs(
+                actual["low"]
+                - anterior["close"]
+            )
         )
 
-        trs.append(tr)
+        tr.append(rango)
 
-    return sum(trs[-period:]) / period
-
-
-# ============================================================
-# SOPORTE Y RESISTENCIA
-# ============================================================
-
-def calc_soporte_resistencia(highs, lows):
-
-    if len(lows) < 20:
-        return lows[-1], highs[-1]
-
-    soporte = min(lows[-20:])
-    resistencia = max(highs[-20:])
-
-    return soporte, resistencia
+    return (
+        sum(tr[-periodo:])
+        / periodo
+    )
 
 
 # ============================================================
 # ADX
 # ============================================================
 
-def calc_adx(highs, lows, closes, period=14):
+def calcular_adx(
+    velas,
+    periodo=14
+):
 
-    try:
+    if len(velas) < periodo + 2:
 
-        tr_list = []
-        plus_dm_list = []
-        minus_dm_list = []
-
-        for i in range(1, len(closes)):
-
-            tr = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i - 1]),
-                abs(lows[i] - closes[i - 1])
-            )
-
-            up = highs[i] - highs[i - 1]
-            down = lows[i - 1] - lows[i]
-
-            plus_dm = (
-                up
-                if up > down and up > 0
-                else 0
-            )
-
-            minus_dm = (
-                down
-                if down > up and down > 0
-                else 0
-            )
-
-            tr_list.append(tr)
-            plus_dm_list.append(plus_dm)
-            minus_dm_list.append(minus_dm)
-
-        if len(tr_list) < period:
-            return 0, 0, 0
-
-        tr14 = sum(tr_list[-period:])
-        plus14 = sum(plus_dm_list[-period:])
-        minus14 = sum(minus_dm_list[-period:])
-
-        if tr14 == 0:
-            return 0, 0, 0
-
-        plus_di = 100 * plus14 / tr14
-        minus_di = 100 * minus14 / tr14
-
-        if plus_di + minus_di == 0:
-            dx = 0
-        else:
-            dx = (
-                100
-                * abs(plus_di - minus_di)
-                / (plus_di + minus_di)
-            )
-
-        return dx, plus_di, minus_di
-
-    except Exception:
         return 0, 0, 0
 
+    trs = []
+    positivos = []
+    negativos = []
+
+    for i in range(
+        1,
+        len(velas)
+    ):
+
+        actual = velas[i]
+        anterior = velas[i - 1]
+
+        tr = max(
+            actual["high"]
+            - actual["low"],
+
+            abs(
+                actual["high"]
+                - anterior["close"]
+            ),
+
+            abs(
+                actual["low"]
+                - anterior["close"]
+            )
+        )
+
+        movimiento_up = (
+            actual["high"]
+            - anterior["high"]
+        )
+
+        movimiento_down = (
+            anterior["low"]
+            - actual["low"]
+        )
+
+        plus_dm = (
+            movimiento_up
+            if (
+                movimiento_up
+                > movimiento_down
+                and movimiento_up > 0
+            )
+            else 0
+        )
+
+        minus_dm = (
+            movimiento_down
+            if (
+                movimiento_down
+                > movimiento_up
+                and movimiento_down > 0
+            )
+            else 0
+        )
+
+        trs.append(tr)
+        positivos.append(plus_dm)
+        negativos.append(minus_dm)
+
+    tr14 = sum(
+        trs[-periodo:]
+    )
+
+    plus14 = sum(
+        positivos[-periodo:]
+    )
+
+    minus14 = sum(
+        negativos[-periodo:]
+    )
+
+    if tr14 == 0:
+
+        return 0, 0, 0
+
+    plus_di = (
+        100 * plus14 / tr14
+    )
+
+    minus_di = (
+        100 * minus14 / tr14
+    )
+
+    suma = (
+        plus_di
+        + minus_di
+    )
+
+    if suma == 0:
+
+        return 0, plus_di, minus_di
+
+    dx = (
+        100
+        * abs(
+            plus_di
+            - minus_di
+        )
+        / suma
+    )
+
+    return (
+        dx,
+        plus_di,
+        minus_di
+    )
+
 
 # ============================================================
-# ANÁLISIS DE CADA TEMPORALIDAD
+# VWAP
 # ============================================================
 
-def check_signal_pro(closes, highs, lows, vols):
+def calcular_vwap(velas):
 
-    if not closes or len(closes) < 50:
+    volumen_total = 0
+    precio_volumen = 0
+
+    for vela in velas[-50:]:
+
+        precio_tipico = (
+            vela["high"]
+            + vela["low"]
+            + vela["close"]
+        ) / 3
+
+        volumen = vela["volume"]
+
+        volumen_total += volumen
+
+        precio_volumen += (
+            precio_tipico
+            * volumen
+        )
+
+    if volumen_total == 0:
+
         return None
 
-    # EMA actual
-    e9_now = ema(closes[-9:], 9)
-    e21_now = ema(closes[-21:], 21)
-
-    # EMA anterior
-    e9_prev = ema(closes[-10:-1], 9)
-    e21_prev = ema(closes[-22:-1], 21)
-
-    # Indicadores
-    rsi = calc_rsi(closes)
-
-    macd, sig = calc_macd(closes)
-
-    atr = calc_atr(
-        highs,
-        lows,
-        closes
+    return (
+        precio_volumen
+        / volumen_total
     )
 
-    sop, res = calc_soporte_resistencia(
-        highs,
-        lows
+
+# ============================================================
+# SOPORTE Y RESISTENCIA
+# ============================================================
+
+def calcular_niveles(velas):
+
+    if len(velas) < 30:
+
+        return None, None
+
+    ultimas = velas[-80:]
+
+    soporte = min(
+        x["low"]
+        for x in ultimas
     )
 
-    adx, plus_di, minus_di = calc_adx(
-        highs,
-        lows,
-        closes
+    resistencia = max(
+        x["high"]
+        for x in ultimas
     )
 
-    # ========================================================
-    # VOLUMEN
-    # ========================================================
-
-    vol_prom = sum(vols[-20:]) / 20
-
-    vol_ok = vols[-1] > vol_prom * 1.2
-
-    # ========================================================
-    # FUERZA
-    # ========================================================
-
-    fuerza = (
-        abs(e9_now - e21_now)
-        / closes[-1]
-        * 100
+    return (
+        soporte,
+        resistencia
     )
 
-    # ========================================================
-    # LONG
-    # ========================================================
+
+# ============================================================
+# FIBONACCI
+# ============================================================
+
+def calcular_fibonacci(velas):
+
+    if len(velas) < 50:
+
+        return {}
+
+    ultimas = velas[-100:]
+
+    maximo = max(
+        x["high"]
+        for x in ultimas
+    )
+
+    minimo = min(
+        x["low"]
+        for x in ultimas
+    )
+
+    diferencia = (
+        maximo
+        - minimo
+    )
+
+    if diferencia <= 0:
+
+        return {}
+
+    return {
+
+        "0.382":
+            maximo
+            - diferencia * 0.382,
+
+        "0.500":
+            maximo
+            - diferencia * 0.500,
+
+        "0.618":
+            maximo
+            - diferencia * 0.618,
+
+        "0.786":
+            maximo
+            - diferencia * 0.786
+    }
+
+
+# ============================================================
+# VOLUMEN
+# ============================================================
+
+def calcular_ratio_volumen(velas):
+
+    if len(velas) < 25:
+
+        return 1
+
+    actual = velas[-1]["volume"]
+
+    promedio = (
+        sum(
+            x["volume"]
+            for x in velas[-21:-1]
+        )
+        / 20
+    )
+
+    if promedio == 0:
+
+        return 1
+
+    return (
+        actual
+        / promedio
+    )
+
+
+# ============================================================
+# TENDENCIA
+# ============================================================
+
+def determinar_tendencia(velas):
+
+    cierres = [
+        x["close"]
+        for x in velas
+    ]
+
+    ema20 = calcular_ema(
+        cierres[-80:],
+        20
+    )
+
+    ema50 = calcular_ema(
+        cierres[-100:],
+        50
+    )
+
+    precio = cierres[-1]
+
+    if not ema20 or not ema50:
+
+        return "NEUTRAL"
 
     if (
-        e9_prev < e21_prev
-        and e9_now > e21_now
-        and 35 < rsi < 68
-        and macd > sig
-        and vol_ok
-        and adx > 20
-        and plus_di > minus_di
+        precio > ema20
+        and ema20 > ema50
+    ):
+
+        return "ALCISTA"
+
+    if (
+        precio < ema20
+        and ema20 < ema50
+    ):
+
+        return "BAJISTA"
+
+    return "NEUTRAL"
+
+
+# ============================================================
+# DIVERGENCIA RSI
+# ============================================================
+
+def detectar_divergencia(velas):
+
+    if len(velas) < 40:
+
+        return None
+
+    cierres = [
+        x["close"]
+        for x in velas
+    ]
+
+    rsi_anterior = calcular_rsi(
+        cierres[:-10]
+    )
+
+    rsi_actual = calcular_rsi(
+        cierres
+    )
+
+    precio_anterior = (
+        cierres[-10]
+    )
+
+    precio_actual = (
+        cierres[-1]
+    )
+
+    if (
+        precio_actual
+        < precio_anterior
+        and rsi_actual
+        > rsi_anterior
+    ):
+
+        return "ALCISTA"
+
+    if (
+        precio_actual
+        > precio_anterior
+        and rsi_actual
+        < rsi_anterior
+    ):
+
+        return "BAJISTA"
+
+    return None
+
+
+# ============================================================
+# ANALISIS DE UNA TEMPORALIDAD
+# ============================================================
+
+def analizar_temporalidad(
+    velas
+):
+
+    cierres = [
+        x["close"]
+        for x in velas
+    ]
+
+    macd_linea, macd_signal = (
+        calcular_macd(cierres)
+    )
+
+    adx_value, plus_di, minus_di = (
+        calcular_adx(velas)
+    )
+
+    soporte, resistencia = (
+        calcular_niveles(velas)
+    )
+
+    atr_value = calcular_atr(
+        velas
+    )
+
+    return {
+
+        "precio":
+            cierres[-1],
+
+        "rsi":
+            calcular_rsi(cierres),
+
+        "ema20":
+            calcular_ema(
+                cierres,
+                20
+            ),
+
+        "ema50":
+            calcular_ema(
+                cierres,
+                50
+            ),
+
+        "macd":
+            macd_linea,
+
+        "macd_signal":
+            macd_signal,
+
+        "adx":
+            adx_value,
+
+        "plus_di":
+            plus_di,
+
+        "minus_di":
+            minus_di,
+
+        "atr":
+            atr_value,
+
+        "atr_pct":
+            (
+                atr_value
+                / cierres[-1]
+                * 100
+            )
+            if atr_value
+            else 0,
+
+        "vwap":
+            calcular_vwap(velas),
+
+        "soporte":
+            soporte,
+
+        "resistencia":
+            resistencia,
+
+        "fibonacci":
+            calcular_fibonacci(velas),
+
+        "volumen_ratio":
+            calcular_ratio_volumen(
+                velas
+            ),
+
+        "tendencia":
+            determinar_tendencia(
+                velas
+            ),
+
+        "divergencia":
+            detectar_divergencia(
+                velas
+            )
+    }
+
+
+# ============================================================
+# ANALIZAR MONEDA COMPLETA
+# ============================================================
+
+def analizar_moneda(symbol):
+
+    resultado = {}
+
+    temporalidades = [
+        "1d",
+        "4h",
+        "1h",
+        "15m",
+        "5m"
+    ]
+
+    for tf in temporalidades:
+
+        velas = obtener_velas(
+            symbol,
+            tf,
+            120
+        )
+
+        if not velas:
+
+            return None
+
+        resultado[tf] = (
+            analizar_temporalidad(
+                velas
+            )
+        )
+
+        time.sleep(0.05)
+
+    resultado["futures"] = {
+
+        "mark":
+            obtener_mark_price(
+                symbol
+            ),
+
+        "open_interest":
+            obtener_open_interest(
+                symbol
+            ),
+
+        "funding":
+            obtener_funding(
+                symbol
+            )
+    }
+
+    return resultado
+
+
+# ============================================================
+# SELECCIONAR 50 MONEDAS
+# ============================================================
+
+def seleccionar_monedas():
+
+    print(
+        "Seleccionando monedas..."
+    )
+
+    contratos = obtener_contratos()
+
+    if not contratos:
+
+        return []
+
+    volumenes = obtener_volumenes()
+
+    candidatos = []
+
+    for symbol in contratos:
+
+        volumen = volumenes.get(
+            symbol,
+            0
+        )
+
+        # Evitar monedas con muy poca liquidez.
+        if volumen < 20_000_000:
+
+            continue
+
+        velas = obtener_velas(
+            symbol,
+            "4h",
+            80
+        )
+
+        if not velas:
+
+            continue
+
+        atr_value = calcular_atr(
+            velas
+        )
+
+        if not atr_value:
+
+            continue
+
+        precio = velas[-1]["close"]
+
+        if precio <= 0:
+
+            continue
+
+        volatilidad = (
+            atr_value
+            / precio
+            * 100
+        )
+
+        candidatos.append(
+            {
+                "symbol": symbol,
+                "volatilidad": volatilidad,
+                "volumen": volumen
+            }
+        )
+
+        time.sleep(0.03)
+
+    if not candidatos:
+
+        return []
+
+    # Ordenar por volatilidad.
+    candidatos.sort(
+        key=lambda x:
+        x["volatilidad"]
+    )
+
+    tranquilas = candidatos[
+        :MONEDAS_BAJA_VOLATILIDAD
+    ]
+
+    volatiles = candidatos[
+        -MONEDAS_ALTA_VOLATILIDAD:
+    ]
+
+    seleccionadas = (
+        tranquilas
+        + volatiles
+    )
+
+    # Quitar duplicados.
+    resultado = []
+
+    vistos = set()
+
+    for x in seleccionadas:
+
+        symbol = x["symbol"]
+
+        if symbol not in vistos:
+
+            vistos.add(symbol)
+
+            resultado.append(symbol)
+
+    print(
+        "Monedas seleccionadas:",
+        len(resultado)
+    )
+
+    return resultado[:TOTAL_MONEDAS]
+
+
+# ============================================================
+# CONFLUENCIA
+# ============================================================
+
+def calcular_confluencia(data):
+
+    long_score = 0
+    short_score = 0
+
+    long_motivos = []
+    short_motivos = []
+
+    # --------------------------------------------------------
+    # 1D
+    # --------------------------------------------------------
+
+    if data["1d"]["tendencia"] == "ALCISTA":
+
+        long_score += 2
+
+        long_motivos.append(
+            "Tendencia 1D alcista"
+        )
+
+    elif data["1d"]["tendencia"] == "BAJISTA":
+
+        short_score += 2
+
+        short_motivos.append(
+            "Tendencia 1D bajista"
+        )
+
+    # --------------------------------------------------------
+    # 4H
+    # --------------------------------------------------------
+
+    if data["4h"]["tendencia"] == "ALCISTA":
+
+        long_score += 2
+
+        long_motivos.append(
+            "Estructura 4H alcista"
+        )
+
+    elif data["4h"]["tendencia"] == "BAJISTA":
+
+        short_score += 2
+
+        short_motivos.append(
+            "Estructura 4H bajista"
+        )
+
+    # --------------------------------------------------------
+    # 1H RSI
+    # --------------------------------------------------------
+
+    rsi = data["1h"]["rsi"]
+
+    if rsi <= 40:
+
+        long_score += 1
+
+        long_motivos.append(
+            f"RSI 1H bajo ({rsi:.1f})"
+        )
+
+    elif rsi >= 60:
+
+        short_score += 1
+
+        short_motivos.append(
+            f"RSI 1H alto ({rsi:.1f})"
+        )
+
+    # --------------------------------------------------------
+    # Divergencia
+    # --------------------------------------------------------
+
+    divergencia = (
+        data["1h"]["divergencia"]
+    )
+
+    if divergencia == "ALCISTA":
+
+        long_score += 1
+
+        long_motivos.append(
+            "Divergencia RSI alcista"
+        )
+
+    elif divergencia == "BAJISTA":
+
+        short_score += 1
+
+        short_motivos.append(
+            "Divergencia RSI bajista"
+        )
+
+    # --------------------------------------------------------
+    # MACD
+    # --------------------------------------------------------
+
+    macd = data["1h"]["macd"]
+
+    macd_signal = (
+        data["1h"]["macd_signal"]
+    )
+
+    if macd > macd_signal:
+
+        long_score += 1
+
+        long_motivos.append(
+            "MACD 1H alcista"
+        )
+
+    elif macd < macd_signal:
+
+        short_score += 1
+
+        short_motivos.append(
+            "MACD 1H bajista"
+        )
+
+    # --------------------------------------------------------
+    # ADX
+    # --------------------------------------------------------
+
+    adx = data["1h"]["adx"]
+
+    plus_di = data["1h"]["plus_di"]
+
+    minus_di = data["1h"]["minus_di"]
+
+    if adx >= 20:
+
+        if plus_di > minus_di:
+
+            long_score += 1
+
+            long_motivos.append(
+                f"ADX fuerte ({adx:.1f})"
+            )
+
+        elif minus_di > plus_di:
+
+            short_score += 1
+
+            short_motivos.append(
+                f"ADX fuerte ({adx:.1f})"
+            )
+
+    # --------------------------------------------------------
+    # Volumen 15M
+    # --------------------------------------------------------
+
+    volumen = (
+        data["15m"]["volumen_ratio"]
+    )
+
+    if volumen >= 1.30:
+
+        if long_score > short_score:
+
+            long_score += 1
+
+            long_motivos.append(
+                f"Volumen elevado ({volumen:.1f}x)"
+            )
+
+        elif short_score > long_score:
+
+            short_score += 1
+
+            short_motivos.append(
+                f"Volumen elevado ({volumen:.1f}x)"
+            )
+
+    # --------------------------------------------------------
+    # VWAP
+    # --------------------------------------------------------
+
+    precio = data["1h"]["precio"]
+
+    vwap = data["1h"]["vwap"]
+
+    if vwap:
+
+        if precio > vwap:
+
+            long_score += 1
+
+            long_motivos.append(
+                "Precio sobre VWAP"
+            )
+
+        elif precio < vwap:
+
+            short_score += 1
+
+            short_motivos.append(
+                "Precio bajo VWAP"
+            )
+
+    # --------------------------------------------------------
+    # Decisión
+    # --------------------------------------------------------
+
+    if (
+        long_score >= MIN_SCORE
+        and long_score > short_score
     ):
 
         return (
             "LONG",
-            rsi,
-            fuerza,
-            atr,
-            sop,
-            res,
-            adx
+            long_score,
+            long_motivos
         )
 
-    # ========================================================
-    # SHORT
-    # ========================================================
-
     if (
-        e9_prev > e21_prev
-        and e9_now < e21_now
-        and rsi > 35
-        and macd < sig
-        and vol_ok
-        and adx > 20
-        and minus_di > plus_di
+        short_score >= MIN_SCORE
+        and short_score > long_score
     ):
 
         return (
             "SHORT",
-            rsi,
-            fuerza,
-            atr,
-            sop,
-            res,
-            adx
+            short_score,
+            short_motivos
         )
 
-    return None
+    return (
+        None,
+        max(
+            long_score,
+            short_score
+        ),
+        []
+    )
+
+
+# ============================================================
+# BUSCAR ZONA DE ENTRADA
+# ============================================================
+
+def buscar_zona(
+    data,
+    direccion
+):
+
+    precio = data["1h"]["precio"]
+
+    soporte = data["4h"]["soporte"]
+
+    resistencia = data["4h"]["resistencia"]
+
+    fibonacci = (
+        data["4h"]["fibonacci"]
+    )
+
+    atr_value = data["4h"]["atr"]
+
+    if not atr_value:
+
+        return None
+
+    niveles = []
+
+    if direccion == "LONG":
+
+        if soporte and soporte < precio:
+
+            niveles.append(soporte)
+
+        for nombre in [
+            "0.618",
+            "0.786"
+        ]:
+
+            nivel = fibonacci.get(
+                nombre
+            )
+
+            if (
+                nivel
+                and nivel < precio
+            ):
+
+                niveles.append(nivel)
+
+        vwap = data["4h"]["vwap"]
+
+        if vwap and vwap < precio:
+
+            niveles.append(vwap)
+
+        if not niveles:
+
+            return None
+
+        nivel = max(niveles)
+
+    else:
+
+        if (
+            resistencia
+            and resistencia > precio
+        ):
+
+            niveles.append(
+                resistencia
+            )
+
+        for nombre in [
+            "0.382",
+            "0.500",
+            "0.618"
+        ]:
+
+            nivel = fibonacci.get(
+                nombre
+            )
+
+            if (
+                nivel
+                and nivel > precio
+            ):
+
+                niveles.append(nivel)
+
+        vwap = data["4h"]["vwap"]
+
+        if vwap and vwap > precio:
+
+            niveles.append(vwap)
+
+        if not niveles:
+
+            return None
+
+        nivel = min(niveles)
+
+    ancho = atr_value * 0.30
+
+    zona_min = (
+        nivel - ancho
+    )
+
+    zona_max = (
+        nivel + ancho
+    )
+
+    return (
+        zona_min,
+        zona_max,
+        nivel
+    )
+
+
+# ============================================================
+# ¿ESTA CERCA DE LA ZONA?
+# ============================================================
+
+def esta_cerca(
+    precio,
+    zona_min,
+    zona_max,
+    atr_value
+):
+
+    if (
+        zona_min
+        <= precio
+        <= zona_max
+    ):
+
+        return True
+
+    if precio > zona_max:
+
+        distancia = (
+            precio
+            - zona_max
+        )
+
+    else:
+
+        distancia = (
+            zona_min
+            - precio
+        )
+
+    return (
+        abs(distancia)
+        <= atr_value * PREALERTA_ATR
+    )
+
+
+# ============================================================
+# CONFIRMACION 5M
+# ============================================================
+
+def confirmar_entrada(
+    data,
+    direccion,
+    zona_min,
+    zona_max
+):
+
+    precio = data["5m"]["precio"]
+
+    atr_value = data["5m"]["atr"]
+
+    if not atr_value:
+
+        return False
+
+    margen = atr_value * 0.50
+
+    cerca = (
+        zona_min - margen
+        <= precio
+        <= zona_max + margen
+    )
+
+    if not cerca:
+
+        return False
+
+    rsi = data["5m"]["rsi"]
+
+    macd = data["5m"]["macd"]
+
+    macd_signal = (
+        data["5m"]["macd_signal"]
+    )
+
+    adx = data["5m"]["adx"]
+
+    plus_di = data["5m"]["plus_di"]
+
+    minus_di = data["5m"]["minus_di"]
+
+    volumen = (
+        data["5m"]["volumen_ratio"]
+    )
+
+    if adx < 18:
+
+        return False
+
+    if volumen < 0.90:
+
+        return False
+
+    if direccion == "LONG":
+
+        if rsi > 68:
+
+            return False
+
+        if macd <= macd_signal:
+
+            return False
+
+        if plus_di <= minus_di:
+
+            return False
+
+        return True
+
+    else:
+
+        if rsi < 32:
+
+            return False
+
+        if macd >= macd_signal:
+
+            return False
+
+        if minus_di <= plus_di:
+
+            return False
+
+        return True
 
 
 # ============================================================
 # APALANCAMIENTO
 # ============================================================
 
-def get_leverage(conf, fuerza, adx):
+def calcular_apalancamiento(
+    score,
+    adx,
+    volatilidad
+):
 
-    # Señal muy fuerte
-    if conf >= 5 and adx >= 30 and fuerza >= 0.50:
-        return 10
+    # Base
+    leverage = 5
 
-    # Señal fuerte
-    if conf >= 5 and adx >= 27:
-        return 9
+    # Mejor confluencia
+    if score >= 8:
 
-    if conf >= 4 and adx >= 28:
-        return 8
+        leverage = 6
 
-    if conf >= 4 and adx >= 24:
-        return 7
+    if score >= 9:
 
-    if conf >= 3 and adx >= 25:
-        return 6
+        leverage = 7
 
-    return 5
+    # Mucha fuerza y volatilidad moderada
+    if (
+        score >= 9
+        and adx >= 28
+        and volatilidad < 2.0
+    ):
+
+        leverage = 8
+
+    # x9/x10 solamente en señales
+    # excepcionalmente fuertes.
+    if (
+        score >= 10
+        and adx >= 30
+        and volatilidad < 1.50
+    ):
+
+        leverage = 10
+
+    return max(
+        MIN_LEVERAGE,
+        min(
+            leverage,
+            MAX_LEVERAGE
+        )
+    )
 
 
 # ============================================================
-# CÁLCULO DE GANANCIA NETA
+# TP Y STOP
 # ============================================================
 
-def calcular_ganancia_neta(precio, tp, leverage):
+def calcular_tp_sl(
+    precio,
+    atr_value,
+    direccion
+):
 
-    movimiento = abs(tp - precio) / precio * 100
+    stop_distancia = (
+        atr_value * 1.35
+    )
 
-    ganancia_bruta = movimiento * leverage
+    tp1_distancia = (
+        atr_value * 1.50
+    )
 
-    comisiones = COMISION_POR_LADO * 2
+    tp2_distancia = (
+        atr_value * 2.50
+    )
 
-    ganancia_neta = ganancia_bruta - comisiones
+    if direccion == "LONG":
 
-    return movimiento, ganancia_bruta, ganancia_neta
+        stop = (
+            precio
+            - stop_distancia
+        )
+
+        tp1 = (
+            precio
+            + tp1_distancia
+        )
+
+        tp2 = (
+            precio
+            + tp2_distancia
+        )
+
+    else:
+
+        stop = (
+            precio
+            + stop_distancia
+        )
+
+        tp1 = (
+            precio
+            - tp1_distancia
+        )
+
+        tp2 = (
+            precio
+            - tp2_distancia
+        )
+
+    return (
+        stop,
+        tp1,
+        tp2
+    )
+
+
+# ============================================================
+# RESULTADO ESTIMADO
+# ============================================================
+
+def calcular_ganancia(
+    entrada,
+    objetivo,
+    leverage
+):
+
+    movimiento = (
+        abs(
+            objetivo
+            - entrada
+        )
+        / entrada
+    ) * 100
+
+    resultado_bruto = (
+        movimiento
+        * leverage
+    )
+
+    resultado_neto = (
+        resultado_bruto
+        - COMISION_TOTAL
+    )
+
+    return (
+        movimiento,
+        resultado_bruto,
+        resultado_neto
+    )
 
 
 # ============================================================
 # FORMATO DE PRECIO
 # ============================================================
 
-def formato_precio(precio):
+def precio_texto(precio):
 
-    if precio < 0.000001:
-        return ".10f"
+    if precio >= 1000:
 
-    if precio < 0.01:
-        return ".8f"
+        return f"{precio:,.2f}"
 
-    if precio < 1:
-        return ".5f"
+    if precio >= 1:
 
-    if precio < 100:
-        return ".3f"
+        return f"{precio:,.4f}"
 
-    return ".2f"
+    if precio >= 0.01:
+
+        return f"{precio:.6f}"
+
+    return f"{precio:.10f}"
+
+
+# ============================================================
+# PREALERTA
+# ============================================================
+
+def mandar_prealerta(
+    symbol,
+    data,
+    direccion,
+    score,
+    motivos,
+    zona
+):
+
+    zona_min, zona_max, nivel = zona
+
+    precio = data["5m"]["precio"]
+
+    distancia = (
+        abs(
+            precio
+            - nivel
+        )
+        / precio
+    ) * 100
+
+    if direccion == "LONG":
+
+        titulo = (
+            "🟡 PREALERTA LONG"
+        )
+
+    else:
+
+        titulo = (
+            "🟠 PREALERTA SHORT"
+        )
+
+    mensaje = (
+        f"{titulo}\n"
+        f"{symbol}\n\n"
+
+        f"💰 Precio actual: "
+        f"{precio_texto(precio)}\n"
+
+        f"🎯 Zona: "
+        f"{precio_texto(zona_min)}"
+        f" — "
+        f"{precio_texto(zona_max)}\n"
+
+        f"📍 Nivel: "
+        f"{precio_texto(nivel)}\n"
+
+        f"📏 Distancia: "
+        f"{distancia:.2f}%\n\n"
+
+        f"⭐ Confluencia: "
+        f"{score}/10\n\n"
+
+        "📊 Motivos:\n"
+        + "\n".join(
+            "• " + motivo
+            for motivo in motivos
+        )
+        + "\n\n"
+
+        "⚠️ PREPARÁ LA OPERACIÓN.\n"
+        "Todavía NO entrar.\n"
+        "Esperar confirmación."
+    )
+
+    enviar_telegram(
+        mensaje
+    )
+
+
+# ============================================================
+# CONFIRMACION
+# ============================================================
+
+def mandar_confirmacion(
+    symbol,
+    data,
+    direccion,
+    score,
+    motivos
+):
+
+    precio = data["5m"]["precio"]
+
+    atr_value = data["1h"]["atr"]
+
+    if not atr_value:
+
+        return
+
+    stop, tp1, tp2 = (
+        calcular_tp_sl(
+            precio,
+            atr_value,
+            direccion
+        )
+    )
+
+    adx = data["1h"]["adx"]
+
+    volatilidad = (
+        data["1h"]["atr_pct"]
+    )
+
+    leverage = (
+        calcular_apalancamiento(
+            score,
+            adx,
+            volatilidad
+        )
+    )
+
+    movimiento, bruto, neto = (
+        calcular_ganancia(
+            precio,
+            tp2,
+            leverage
+        )
+    )
+
+    # No mandar si no alcanza el
+    # mínimo que configuramos.
+    if neto < MIN_GANANCIA_NETA:
+
+        print(
+            symbol,
+            "descartado:",
+            "ganancia neta",
+            neto
+        )
+
+        return
+
+    funding = (
+        data["futures"]["funding"]
+    )
+
+    open_interest = (
+        data["futures"]["open_interest"]
+    )
+
+    if funding is None:
+
+        funding_text = "N/D"
+
+    else:
+
+        funding_text = (
+            f"{funding:.4f}%"
+        )
+
+    if open_interest is None:
+
+        oi_text = "N/D"
+
+    else:
+
+        oi_text = (
+            f"{open_interest:,.2f}"
+        )
+
+    if direccion == "LONG":
+
+        titulo = (
+            "🟢 LONG CONFIRMADO"
+        )
+
+    else:
+
+        titulo = (
+            "🔴 SHORT CONFIRMADO"
+        )
+
+    mensaje = (
+        f"{titulo}\n"
+        f"{symbol}\n\n"
+
+        f"💰 ENTRADA: "
+        f"{precio_texto(precio)}\n\n"
+
+        f"🎯 TP1: "
+        f"{precio_texto(tp1)}\n"
+
+        f"🎯 TP2: "
+        f"{precio_texto(tp2)}\n"
+
+        f"🛑 STOP: "
+        f"{precio_texto(stop)}\n\n"
+
+        f"⚡ APALANCAMIENTO: "
+        f"x{leverage}\n"
+
+        f"⭐ CONFLUENCIA: "
+        f"{score}/10\n\n"
+
+        f"📊 RSI 1H: "
+        f"{data['1h']['rsi']:.1f}\n"
+
+        f"📊 ADX 1H: "
+        f"{adx:.1f}\n"
+
+        f"📈 Volatilidad ATR 1H: "
+        f"{volatilidad:.2f}%\n"
+
+        f"💵 Funding: "
+        f"{funding_text}\n"
+
+        f"📊 Open Interest: "
+        f"{oi_text}\n\n"
+
+        f"📈 Movimiento TP2: "
+        f"{movimiento:.2f}%\n"
+
+        f"💰 Resultado bruto: "
+        f"+{bruto:.2f}%\n"
+
+        f"💸 Comisión estimada: "
+        f"-{COMISION_TOTAL:.2f}%\n"
+
+        f"✅ Resultado neto: "
+        f"+{neto:.2f}%\n\n"
+
+        "👤 OPERACIÓN MANUAL\n"
+        "El bot NO compra ni vende.\n\n"
+
+        "📊 Motivos:\n"
+        + "\n".join(
+            "• " + motivo
+            for motivo in motivos
+        )
+    )
+
+    enviar_telegram(
+        mensaje
+    )
+
+
+# ============================================================
+# PROCESAR MONEDA
+# ============================================================
+
+def procesar_moneda(symbol):
+
+    try:
+
+        data = analizar_moneda(
+            symbol
+        )
+
+        if not data:
+
+            return
+
+        direccion, score, motivos = (
+            calcular_confluencia(
+                data
+            )
+        )
+
+        if not direccion:
+
+            return
+
+        zona = buscar_zona(
+            data,
+            direccion
+        )
+
+        if not zona:
+
+            return
+
+        zona_min, zona_max, nivel = (
+            zona
+        )
+
+        precio = data["5m"]["precio"]
+
+        atr_value = data["4h"]["atr"]
+
+        if not atr_value:
+
+            return
+
+        # ----------------------------------------------------
+        # COMPROBAR SI YA HAY UNA SEÑAL ACTIVA
+        # ----------------------------------------------------
+
+        with señales_lock:
+
+            señal_actual = (
+                señales_activas.get(
+                    symbol
+                )
+            )
+
+        # ----------------------------------------------------
+        # PREALERTA
+        # ----------------------------------------------------
+
+        cerca = esta_cerca(
+            precio,
+            zona_min,
+            zona_max,
+            atr_value
+        )
+
+        if cerca:
+
+            # Si no existe señal activa,
+            # mandamos prealerta.
+
+            if not señal_actual:
+
+                mandar_prealerta(
+                    symbol,
+                    data,
+                    direccion,
+                    score,
+                    motivos,
+                    zona
+                )
+
+                with señales_lock:
+
+                    señales_activas[
+                        symbol
+                    ] = {
+                        "direccion":
+                            direccion,
+
+                        "prealerta":
+                            True,
+
+                        "confirmada":
+                            False,
+
+                        "zona":
+                            zona,
+
+                        "timestamp":
+                            time.time()
+                    }
+
+                return
+
+            # Si existe pero es dirección
+            # diferente, nueva oportunidad.
+
+            if (
+                señal_actual["direccion"]
+                != direccion
+            ):
+
+                mandar_prealerta(
+                    symbol,
+                    data,
+                    direccion,
+                    score,
+                    motivos,
+                    zona
+                )
+
+                with señales_lock:
+
+                    señales_activas[
+                        symbol
+                    ] = {
+                        "direccion":
+                            direccion,
+
+                        "prealerta":
+                            True,
+
+                        "confirmada":
+                            False,
+
+                        "zona":
+                            zona,
+
+                        "timestamp":
+                            time.time()
+                    }
+
+                return
+
+        # ----------------------------------------------------
+        # CONFIRMACION
+        # ----------------------------------------------------
+
+        if not confirmar_entrada(
+            data,
+            direccion,
+            zona_min,
+            zona_max
+        ):
+
+            return
+
+        # ----------------------------------------------------
+        # NO REPETIR CONFIRMACION
+        # ----------------------------------------------------
+
+        with señales_lock:
+
+            señal_actual = (
+                señales_activas.get(
+                    symbol
+                )
+            )
+
+            if (
+                señal_actual
+                and señal_actual.get(
+                    "confirmada"
+                )
+                and señal_actual.get(
+                    "direccion"
+                ) == direccion
+            ):
+
+                return
+
+        # ----------------------------------------------------
+        # ENVIAR CONFIRMACION
+        # ----------------------------------------------------
+
+        mandar_confirmacion(
+            symbol,
+            data,
+            direccion,
+            score,
+            motivos
+        )
+
+        with señales_lock:
+
+            señales_activas[
+                symbol
+            ] = {
+                "direccion":
+                    direccion,
+
+                "prealerta":
+                    True,
+
+                "confirmada":
+                    True,
+
+                "zona":
+                    zona,
+
+                "timestamp":
+                    time.time()
+            }
+
+    except Exception as e:
+
+        print(
+            "Error procesando",
+            symbol,
+            ":",
+            e
+        )
+
+
+# ============================================================
+# LIMPIAR SEÑALES ANTIGUAS
+# ============================================================
+
+def limpiar_señales():
+
+    ahora = time.time()
+
+    with señales_lock:
+
+        borrar = []
+
+        for symbol, señal in (
+            señales_activas.items()
+        ):
+
+            timestamp = (
+                señal.get(
+                    "timestamp",
+                    ahora
+                )
+            )
+
+            # Después de 6 horas
+            # permitimos una nueva señal.
+
+            if (
+                ahora
+                - timestamp
+                > 21600
+            ):
+
+                borrar.append(
+                    symbol
+                )
+
+        for symbol in borrar:
+
+            del señales_activas[
+                symbol
+            ]
 
 
 # ============================================================
 # BOT PRINCIPAL
 # ============================================================
 
-def bot_loop():
+def ejecutar_bot():
 
-    print("==========================================")
-    print(" BOT FUTUROS 40 MONEDAS ONLINE")
-    print(" Apalancamiento: x5 - x10")
-    print(" Ganancia mínima neta: 1.5%")
-    print("==========================================")
-
-    send(
-        "🤖 BOT FUTUROS ONLINE\n\n"
-        "40 monedas\n"
-        "5 temporalidades\n"
-        "LONG + SHORT\n"
-        "Apalancamiento sugerido x5-x10\n"
-        "Objetivo mínimo neto 1.5%"
+    print(
+        "===================================="
     )
+
+    print(
+        " BOT FUTUROS CRYPTO INICIADO"
+    )
+
+    print(
+        "===================================="
+    )
+
+    enviar_telegram(
+        "🤖 BOT FUTUROS ONLINE\n\n"
+        "Sistema de análisis activado.\n\n"
+        "📊 50 monedas dinámicas\n"
+        "🟢 LONG\n"
+        "🔴 SHORT\n"
+        "🟡 PREALERTA\n\n"
+        "⏱️ 1D / 4H / 1H / 15M / 5M\n\n"
+        "👤 Operaciones manuales."
+    )
+
+    monedas = []
+
+    ultima_seleccion = 0
 
     while True:
 
-        for moneda in MONEDAS:
+        try:
 
-            long_c = 0
-            short_c = 0
+            ahora = time.time()
 
-            señales = []
+            # Recalcular las 50 monedas
+            # cada 6 horas.
 
-            precio_actual = None
+            if (
+                not monedas
+                or ahora
+                - ultima_seleccion
+                > 21600
+            ):
 
-            # =================================================
-            # ANALIZAR LAS 5 TEMPORALIDADES
-            # =================================================
-
-            for tf in TIMEFRAMES:
-
-                closes, highs, lows, vols = get_data(
-                    moneda,
-                    tf
+                nuevas = (
+                    seleccionar_monedas()
                 )
 
-                if not closes:
-                    continue
+                if nuevas:
 
-                if precio_actual is None:
-                    precio_actual = closes[-1]
+                    monedas = nuevas
 
-                resultado = check_signal_pro(
-                    closes,
-                    highs,
-                    lows,
-                    vols
-                )
-
-                if resultado:
-
-                    (
-                        tipo,
-                        rsi,
-                        fuerza,
-                        atr,
-                        sop,
-                        resis,
-                        adx
-                    ) = resultado
-
-                    señales.append(
-                        (
-                            tf,
-                            tipo,
-                            rsi,
-                            fuerza,
-                            atr,
-                            sop,
-                            resis,
-                            adx
-                        )
+                    ultima_seleccion = (
+                        ahora
                     )
 
-                    if tipo == "LONG":
-                        long_c += 1
+                    print(
+                        "Universo actualizado:",
+                        len(monedas)
+                    )
 
-                    else:
-                        short_c += 1
+            if not monedas:
+
+                print(
+                    "No hay monedas disponibles."
+                )
+
+                time.sleep(60)
+
+                continue
+
+            print(
+                "--------------------------------"
+            )
+
+            print(
+                "Nuevo ciclo:",
+                len(monedas),
+                "monedas"
+            )
+
+            print(
+                "--------------------------------"
+            )
+
+            for symbol in monedas:
+
+                print(
+                    "Analizando:",
+                    symbol
+                )
+
+                procesar_moneda(
+                    symbol
+                )
+
+                # Pequeña pausa para
+                # reducir presión sobre API.
 
                 time.sleep(0.15)
 
-            # =================================================
-            # NO HAY 3 TEMPORALIDADES COINCIDENTES
-            # =================================================
-
-            if long_c < 3 and short_c < 3:
-
-                # Importante:
-                # si la señal desapareció,
-                # permitimos una nueva señal futura.
-
-                ultima_senal_enviada.pop(
-                    moneda,
-                    None
-                )
-
-                continue
-
-            # =================================================
-            # DETERMINAR LONG / SHORT
-            # =================================================
-
-            if long_c >= 3 and long_c >= short_c:
-
-                tipo_final = "LONG"
-                conf = long_c
-
-            elif short_c >= 3:
-
-                tipo_final = "SHORT"
-                conf = short_c
-
-            else:
-                continue
-
-            # =================================================
-            # EVITAR REPETIR LA MISMA SEÑAL
-            # =================================================
-
-            if ultima_senal_enviada.get(moneda) == tipo_final:
-
-                continue
-
-            señales_final = [
-                s
-                for s in señales
-                if s[1] == tipo_final
-            ]
-
-            if not señales_final:
-                continue
-
-            # =================================================
-            # PROMEDIOS
-            # =================================================
-
-            fuerza_prom = (
-                sum(s[3] for s in señales_final)
-                / len(señales_final)
-            )
-
-            atr_prom = (
-                sum(s[4] for s in señales_final)
-                / len(señales_final)
-            )
-
-            adx_prom = (
-                sum(s[7] for s in señales_final)
-                / len(señales_final)
-            )
-
-            rsi_prom = (
-                sum(s[2] for s in señales_final)
-                / len(señales_final)
-            )
-
-            precio = precio_actual
-
-            if not precio or atr_prom <= 0:
-                continue
-
-            # =================================================
-            # APALANCAMIENTO
-            # =================================================
-
-            lev = get_leverage(
-                conf,
-                fuerza_prom,
-                adx_prom
-            )
-
-            lev = max(
-                MIN_APALANCAMIENTO,
-                min(
-                    lev,
-                    MAX_APALANCAMIENTO
-                )
-            )
-
-            # =================================================
-            # STOP LOSS / TAKE PROFIT
-            # =================================================
-
-            if tipo_final == "LONG":
-
-                sl = precio - (
-                    atr_prom * 1.5
-                )
-
-                tp = precio + (
-                    atr_prom * 2.5
-                )
-
-            else:
-
-                sl = precio + (
-                    atr_prom * 1.5
-                )
-
-                tp = precio - (
-                    atr_prom * 2.5
-                )
-
-            if tp <= 0 or sl <= 0:
-                continue
-
-            # =================================================
-            # GANANCIA
-            # =================================================
-
-            (
-                movimiento,
-                ganancia_bruta,
-                ganancia_neta
-            ) = calcular_ganancia_neta(
-                precio,
-                tp,
-                lev
-            )
-
-            # =================================================
-            # FILTRO 1.5% NETO
-            # =================================================
-
-            if ganancia_neta < MIN_GANANCIA_NETA:
-
-                print(
-                    f"{moneda} {tipo_final} descartada - "
-                    f"ganancia neta {ganancia_neta:.2f}%"
-                )
-
-                continue
-
-            # =================================================
-            # TEMPORALIDADES
-            # =================================================
-
-            estados_tf = []
-
-            for tf in TIMEFRAMES:
-
-                encontrada = [
-                    s
-                    for s in señales
-                    if s[0] == tf
-                ]
-
-                if encontrada:
-
-                    if encontrada[0][1] == "LONG":
-                        estados_tf.append(
-                            f"{tf}: 🟢 LONG"
-                        )
-                    else:
-                        estados_tf.append(
-                            f"{tf}: 🔴 SHORT"
-                        )
-
-                else:
-
-                    estados_tf.append(
-                        f"{tf}: ⚪"
-                    )
-
-            # =================================================
-            # CONFIANZA
-            # =================================================
-
-            confianza = int(
-                (conf / 5) * 10
-            )
-
-            if adx_prom >= 30:
-                confianza += 1
-
-            if confianza > 10:
-                confianza = 10
-
-            # =================================================
-            # FORMATO
-            # =================================================
-
-            fmt = formato_precio(precio)
-
-            base = moneda.replace(
-                "USDT",
-                ""
-            )
-
-            # =================================================
-            # MENSAJE LONG
-            # =================================================
-
-            if tipo_final == "LONG":
-
-                msg = (
-                    f"🟢 SEÑAL LONG — {base}/USDT\n\n"
-
-                    f"💰 Entrada: {precio:{fmt}}\n"
-                    f"🎯 Take Profit: {tp:{fmt}}\n"
-                    f"🛑 Stop Loss: {sl:{fmt}}\n\n"
-
-                    f"⚡ Apalancamiento sugerido: x{lev}\n"
-                    f"📊 Confianza: {confianza}/10\n\n"
-
-                    f"📈 RSI: {rsi_prom:.1f}\n"
-                    f"📊 ADX: {adx_prom:.1f}\n"
-                    f"💪 Fuerza: {fuerza_prom:.2f}%\n\n"
-
-                    f"📈 Movimiento TP: +{movimiento:.2f}%\n"
-                    f"💵 Ganancia bruta estimada: "
-                    f"+{ganancia_bruta:.2f}%\n"
-                    f"💸 Comisiones estimadas: "
-                    f"-{COMISION_POR_LADO * 2:.2f}%\n"
-                    f"✅ Ganancia neta estimada: "
-                    f"+{ganancia_neta:.2f}%\n\n"
-
-                    f"⏱ TEMPORALIDADES\n"
-                    + "\n".join(estados_tf)
-                )
-
-            # =================================================
-            # MENSAJE SHORT
-            # =================================================
-
-            else:
-
-                msg = (
-                    f"🔴 SEÑAL SHORT — {base}/USDT\n\n"
-
-                    f"💰 Entrada: {precio:{fmt}}\n"
-                    f"🎯 Take Profit: {tp:{fmt}}\n"
-                    f"🛑 Stop Loss: {sl:{fmt}}\n\n"
-
-                    f"⚡ Apalancamiento sugerido: x{lev}\n"
-                    f"📊 Confianza: {confianza}/10\n\n"
-
-                    f"📉 RSI: {rsi_prom:.1f}\n"
-                    f"📊 ADX: {adx_prom:.1f}\n"
-                    f"💪 Fuerza: {fuerza_prom:.2f}%\n\n"
-
-                    f"📉 Movimiento TP: +{movimiento:.2f}%\n"
-                    f"💵 Ganancia bruta estimada: "
-                    f"+{ganancia_bruta:.2f}%\n"
-                    f"💸 Comisiones estimadas: "
-                    f"-{COMISION_POR_LADO * 2:.2f}%\n"
-                    f"✅ Ganancia neta estimada: "
-                    f"+{ganancia_neta:.2f}%\n\n"
-
-                    f"⏱ TEMPORALIDADES\n"
-                    + "\n".join(estados_tf)
-                )
-
-            # =================================================
-            # ENVIAR TELEGRAM
-            # =================================================
-
-            send(msg)
-
-            # Guardamos la señal para no repetirla
-            ultima_senal_enviada[moneda] = tipo_final
+            limpiar_señales()
 
             print(
-                f"SEÑAL ENVIADA: "
-                f"{moneda} {tipo_final} "
-                f"x{lev} "
-                f"neto {ganancia_neta:.2f}%"
+                "Ciclo terminado."
             )
 
-        # =====================================================
-        # ESPERAR 3 MINUTOS
-        # =====================================================
+            print(
+                "Esperando",
+                INTERVALO_ANALISIS,
+                "segundos."
+            )
 
-        print("Esperando 3 minutos...")
-        time.sleep(180)
+            time.sleep(
+                INTERVALO_ANALISIS
+            )
+
+        except Exception as e:
+
+            print(
+                "Error general:",
+                e
+            )
+
+            time.sleep(30)
 
 
 # ============================================================
-# PÁGINA PRINCIPAL
+# RUTA PRINCIPAL
 # ============================================================
 
 @app.route("/")
-def home():
+def inicio():
 
     return (
-        "BOT FUTUROS 40 MONEDAS ONLINE"
+        "BOT FUTUROS "
+        "CONFLUENCIAS ONLINE"
     )
 
 
@@ -901,47 +2523,28 @@ def home():
 @app.route("/test")
 def test():
 
-    send(
-        "🟢 SEÑAL LONG — BTC/USDT\n\n"
-
-        "💰 Entrada: 112000.00\n"
-        "🎯 Take Profit: 113500.00\n"
-        "🛑 Stop Loss: 111300.00\n\n"
-
-        "⚡ Apalancamiento sugerido: x5\n"
-        "📊 Confianza: 9/10\n\n"
-
-        "📈 RSI: 57.8\n"
-        "📊 ADX: 31.4\n"
-        "💪 Fuerza: 0.62%\n\n"
-
-        "📈 Movimiento TP: +1.34%\n"
-        "💵 Ganancia bruta estimada: +6.70%\n"
-        "💸 Comisiones estimadas: -0.10%\n"
-        "✅ Ganancia neta estimada: +6.60%\n\n"
-
-        "⏱ TEMPORALIDADES\n"
-        "5m: 🟢 LONG\n"
-        "15m: 🟢 LONG\n"
-        "1h: 🟢 LONG\n"
-        "4h: 🟢 LONG\n"
-        "1d: 🟡"
+    enviar_telegram(
+        "🟢 TEST TELEGRAM\n\n"
+        "El bot está conectado correctamente."
     )
 
-    return "TEST ENVIADO"
+    return (
+        "TEST TELEGRAM ENVIADO"
+    )
 
 
 # ============================================================
-# INICIAR BOT
+# INICIAR
 # ============================================================
-
-threading.Thread(
-    target=bot_loop,
-    daemon=True
-).start()
-
 
 if __name__ == "__main__":
+
+    hilo = threading.Thread(
+        target=ejecutar_bot,
+        daemon=True
+    )
+
+    hilo.start()
 
     app.run(
         host="0.0.0.0",
