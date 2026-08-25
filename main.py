@@ -29,7 +29,7 @@ from flask import Flask, request
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Token simple para proteger el endpoint /test de uso público.
+# Token simple para proteger el endpoint /test de uso público. 
 # Definilo como variable de entorno; si no lo definís, /test queda deshabilitado.
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
