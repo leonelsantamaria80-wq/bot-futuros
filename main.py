@@ -1279,12 +1279,46 @@ def mandar_orden_compra(symbol, data, direccion, score, motivos, zona):
     funding_text = "N/D" if funding is None else f"{funding:.4f}%"
     oi_text = "N/D" if open_interest is None else f"{open_interest:,.2f}"
 
+    # ------------------------------------------------------------
+    # Urgencia estimada: ¿ya está en zona, o cuánto le falta?
+    # Es una referencia aproximada (velas de 5M según el ATR de 5M
+    # actual), no una garantía — la volatilidad puede cambiar de
+    # golpe. Sirve para tener una idea de si hay que actuar ya o
+    # si todavía hay algo de margen.
+    # ------------------------------------------------------------
+    dentro_zona = zona_min <= precio <= zona_max
+    atr_5m = data["5m"]["atr"]
+
+    if dentro_zona:
+        urgencia_texto = (
+            "⏱️ YA ESTÁ DENTRO de la zona ahora mismo — "
+            "si vas a entrar, es cuestión de minutos."
+        )
+    elif atr_5m:
+        distancia_precio = (
+            precio - zona_max if precio > zona_max else zona_min - precio
+        )
+        velas_estimadas = distancia_precio / atr_5m
+        minutos_estimados = velas_estimadas * 5
+        urgencia_texto = (
+            f"⏱️ Todavía se está acercando — a un ritmo normal de "
+            f"movimiento, unos ~{minutos_estimados:.0f} min hasta tocar "
+            "la zona (estimado, no garantizado: puede acelerar, "
+            "frenar o rebotar antes de llegar)."
+        )
+    else:
+        urgencia_texto = (
+            "⏱️ Todavía se está acercando a la zona (sin datos "
+            "suficientes para estimar cuánto puede tardar)."
+        )
+
     titulo = "🟢 ORDEN DE COMPRA (LONG)" if direccion == "LONG" else "🔴 ORDEN DE VENTA (SHORT)"
 
     mensaje = (
         f"{titulo}\n{symbol}\n\n"
         f"💰 PRECIO ACTUAL: {precio_texto(precio)}\n"
-        f"🎯 ZONA DE ENTRADA: {precio_texto(zona_min)} — {precio_texto(zona_max)}\n\n"
+        f"🎯 ZONA DE ENTRADA: {precio_texto(zona_min)} — {precio_texto(zona_max)}\n"
+        f"{urgencia_texto}\n\n"
         f"🎯 TP1: {precio_texto(tp1)}\n"
         f"🎯 TP2: {precio_texto(tp2)}\n"
         f"🛑 STOP: {precio_texto(stop)}\n\n"
