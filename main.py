@@ -2218,9 +2218,20 @@ def mandar_orden_compra(
 
     atr_value = data["1h"]["atr"]
 
-    if not atr_value:
-        return None
-
+        if not atr_value:
+            return None
+              # --- NUEVO FILTRO RSI ---
+            rsi = data["5m"]["rsi"]
+        
+            # Evitar comprar caro en operaciones alcistas
+            if direccion == "LONG" and rsi > 75:
+                return None
+    
+        # Evitar vender barato en operaciones bajistas
+        if direccion == "SHORT" and rsi < 25:
+            return None
+        # --- FIN FILTRO ---
+  
     # ========================================================
     # MINIMO DE LAS ULTIMAS 20 VELAS
     # ========================================================
