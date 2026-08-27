@@ -2,6 +2,7 @@ import os
 import time
 import json
 import threading
+from flask import Flask
 import requests
 import datetime
 import math
@@ -9,8 +10,8 @@ import math
 # ============================================================
 # CONFIGURACIÓN GLOBAL
 # ============================================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "TU_TOKEN_AQUI")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "TU_CHAT_ID_AQUI")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BINANCE_URL = "https://fapi.binance.com"
 
 señales_activas = {}
@@ -203,10 +204,18 @@ def ejecutar_bot():
             print(f"Error en el ciclo principal: {e}")
             
         time.sleep(60) # Espera 1 minuto antes del próximo escaneo
+            # Servidor para Render Free
+app = Flask(__name__)
+@app.route('/')
+def home(): return "Bot futuros OK"
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+threading.Thread(target=run_flask, daemon=True).start()
 
 if __name__ == "__main__":
     ejecutar_bot()
     
+
     
         
         
