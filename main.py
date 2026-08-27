@@ -5,10 +5,7 @@ import threading
 import datetime
 import numpy as np
 import requests
-
-from zoneinfo import ZoneInfo
 from flask import Flask, request
-
 
 # ============================================================
 # BOT FUTUROS CRYPTO - SEÑALES TELEGRAM
@@ -34,37 +31,20 @@ from flask import Flask, request
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Token para proteger /test y /estado
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 BINANCE_URL = "https://fapi.binance.com"
-
-
-# ============================================================
-# ARCHIVO DE ESTADO
-# ============================================================
 
 ARCHIVO_ESTADO = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "estado_señales.json"
 )
 
-
-# ============================================================
-# FLASK
-# ============================================================
-
 app = Flask(__name__)
 
-
-# ============================================================
-# SESSION HTTP
-# ============================================================
-
 session = requests.Session()
-
 session.headers.update({
-    "User-Agent": "bot-senales-futuros/2.0"
+    "User-Agent": "bot-senales-futuros/1.0"
 })
 
 
@@ -77,49 +57,40 @@ TOTAL_MONEDAS = 50
 MONEDAS_BAJA_VOLATILIDAD = 40
 MONEDAS_ALTA_VOLATILIDAD = 10
 
-# Cada cuánto analiza nuevamente las monedas
 INTERVALO_ANALISIS = 180
-
-
-# ============================================================
-# CONFLUENCIA
-# ============================================================
 
 MIN_SCORE = 7
 
-
-# ============================================================
-# APALANCAMIENTO
-# ============================================================
-
 MIN_LEVERAGE = 5
 MAX_LEVERAGE = 10
-
-
-# ============================================================
-# GANANCIA MINIMA
-# ============================================================
 
 MIN_GANANCIA_NETA = 1.50
 
 
 # ============================================================
-# FILTRO DE MOMENTUM 5M
+# FILTRO DE SOBRECOMPRA
+# ============================================================
+#
+# Si RSI 1H > 75 O Stoch RSI 1H > 85,
+# se descarta la moneda para evitar entrar demasiado arriba.
+#
+# ============================================================
+
+RSI_MAXIMO_COMPRA = 75
+STOCH_RSI_MAXIMO_COMPRA = 85
+
+
+# ============================================================
+# MOMENTUM 5M
 # ============================================================
 
 UMBRAL_ADX_MINIMO_5M = 18
-
 UMBRAL_VOLUMEN_MINIMO_5M = 0.90
 
 
 # ============================================================
-# COMISION BINANCE
+# COMISION
 # ============================================================
-
-# 0.04% por lado
-# Entrada + salida = 0.08%
-#
-# Si tu comisión real es diferente, podés modificarlo.
 
 COMISION_TAKER_POR_LADO = 0.04
 
@@ -132,38 +103,29 @@ PREALERTA_ATR = 1.50
 
 
 # ============================================================
-# CONTROL DE RATE LIMIT
+# RATE LIMIT / BACKOFF
 # ============================================================
 
 PAUSA_ENTRE_VELAS = 0.12
-
 PAUSA_ENTRE_SELECCION = 0.15
-
 PAUSA_ENTRE_MONEDAS_CICLO = 0.25
 
 ESPERA_MINIMA_RATE_LIMIT = 60
 
 
 # ============================================================
-# ALERTA DE ERRORES BINANCE
+# ALERTA DE FALLAS PERSISTENTES
 # ============================================================
 
 UMBRAL_ERRORES_ALERTA = 5
-
 COOLDOWN_ALERTA_SEGUNDOS = 3600
 
 _errores_consecutivos = 0
-
 _ultimo_codigo_error = None
-
 _ultima_alerta_error = 0
 
 _lock_errores = threading.Lock()
 
-
-# ============================================================
-# REGISTRO DE ERRORES BINANCE
-# ============================================================
 
 def _registrar_fallo_binance(status_code, endpoint):
 
@@ -174,17 +136,14 @@ def _registrar_fallo_binance(status_code, endpoint):
     with _lock_errores:
 
         _errores_consecutivos += 1
-
         _ultimo_codigo_error = status_code
 
         contador = _errores_consecutivos
-
         ahora = time.time()
 
         debe_avisar = (
-            contador >= UMBRAL_ERRORES_ALERTA
-            and ahora - _ultima_alerta_error
-            > COOLDOWN_ALERTA_SEGUNDOS
+            contador == UMBRAL_ERRORES_ALERTA
+            and ahora - _ultima_alerta_error > COOLDOWN_ALERTA_SEGUNDOS
         )
 
         if debe_avisar:
@@ -204,21 +163,19 @@ def _registrar_fallo_binance(status_code, endpoint):
         elif status_code == 403:
 
             explicacion = (
-                "\n\n⚠️ 403 = Binance rechazó el acceso. "
-                "Puede tratarse de un bloqueo de IP o región."
+                "\n\n⚠️ 403 = acceso prohibido por Binance."
             )
 
         elif status_code is None:
 
             explicacion = (
-                "\n\n⚠️ No está llegando respuesta de Binance "
-                "(timeout o error de conexión)."
+                "\n\n⚠️ No está llegando respuesta de Binance."
             )
 
         mensaje = (
             "🔴 BOT SIN DATOS DE BINANCE\n\n"
-            f"Últimos {contador} intentos a {endpoint} fallaron.\n"
-            f"Código: {status_code}\n\n"
+            f"Últimos {contador} intentos a {endpoint} fallaron "
+            f"(código: {status_code}).\n"
             "El bot NO está pudiendo analizar el mercado ahora mismo."
             f"{explicacion}"
         )
@@ -226,25 +183,19 @@ def _registrar_fallo_binance(status_code, endpoint):
         enviar_telegram(mensaje)
 
 
-# ============================================================
-# REGISTRO DE REQUEST EXITOSA
-# ============================================================
-
 def _registrar_ok_binance():
 
     global _errores_consecutivos
 
     with _lock_errores:
-
         _errores_consecutivos = 0
 
 
 # ============================================================
-# PERSISTENCIA DE SEÑALES
+# PERSISTENCIA
 # ============================================================
 
 señales_lock = threading.Lock()
-
 señales_activas = {}
 
 
@@ -253,7 +204,6 @@ def cargar_estado():
     global señales_activas
 
     if not os.path.exists(ARCHIVO_ESTADO):
-
         return
 
     try:
@@ -296,12 +246,7 @@ def guardar_estado():
             encoding="utf-8"
         ) as f:
 
-            json.dump(
-                copia,
-                f,
-                ensure_ascii=False,
-                indent=2
-            )
+            json.dump(copia, f)
 
     except Exception as e:
 
@@ -362,7 +307,7 @@ def enviar_telegram(mensaje):
 
 
 # ============================================================
-# REQUEST BINANCE
+# BINANCE REQUEST
 # ============================================================
 
 def binance_get(
@@ -380,11 +325,6 @@ def binance_get(
                 params=params,
                 timeout=10
             )
-
-
-            # ------------------------------------------------
-            # RATE LIMIT
-            # ------------------------------------------------
 
             if respuesta.status_code in (429, 418):
 
@@ -406,7 +346,6 @@ def binance_get(
 
                     espera = ESPERA_MINIMA_RATE_LIMIT
 
-
                 print(
                     f"Rate limit Binance "
                     f"({respuesta.status_code}). "
@@ -416,11 +355,6 @@ def binance_get(
                 time.sleep(espera)
 
                 continue
-
-
-            # ------------------------------------------------
-            # BLOQUEO
-            # ------------------------------------------------
 
             if respuesta.status_code in (451, 403):
 
@@ -437,11 +371,6 @@ def binance_get(
 
                 return None
 
-
-            # ------------------------------------------------
-            # OTROS ERRORES
-            # ------------------------------------------------
-
             if respuesta.status_code != 200:
 
                 print(
@@ -457,15 +386,9 @@ def binance_get(
 
                 return None
 
-
-            # ------------------------------------------------
-            # OK
-            # ------------------------------------------------
-
             _registrar_ok_binance()
 
             return respuesta.json()
-
 
         except Exception as e:
 
@@ -475,7 +398,6 @@ def binance_get(
             )
 
             time.sleep(2)
-
 
     _registrar_fallo_binance(
         None,
@@ -496,12 +418,9 @@ def obtener_contratos():
     )
 
     if not data:
-
         return []
 
-
     resultado = []
-
 
     for item in data.get(
         "symbols",
@@ -511,19 +430,15 @@ def obtener_contratos():
         try:
 
             if item.get("status") != "TRADING":
-
                 continue
 
             if item.get("contractType") != "PERPETUAL":
-
                 continue
 
             if item.get("quoteAsset") != "USDT":
-
                 continue
 
             symbol = item.get("symbol")
-
 
             if (
                 symbol
@@ -532,11 +447,9 @@ def obtener_contratos():
 
                 resultado.append(symbol)
 
-
         except Exception:
 
             continue
-
 
     return resultado
 
@@ -552,12 +465,9 @@ def obtener_volumenes():
     )
 
     if not data:
-
         return {}
 
-
     resultado = {}
-
 
     for item in data:
 
@@ -569,9 +479,7 @@ def obtener_volumenes():
                 not symbol
                 or not symbol.endswith("USDT")
             ):
-
                 continue
-
 
             resultado[symbol] = float(
                 item.get(
@@ -580,11 +488,9 @@ def obtener_volumenes():
                 )
             )
 
-
         except Exception:
 
             continue
-
 
     return resultado
 
@@ -609,30 +515,29 @@ def obtener_velas(
     )
 
     if not data:
-
         return None
 
-
     velas = []
-
 
     try:
 
         for x in data:
 
-            velas.append(
-                {
-                    "open": float(x[1]),
-                    "high": float(x[2]),
-                    "low": float(x[3]),
-                    "close": float(x[4]),
-                    "volume": float(x[5])
-                }
-            )
+            velas.append({
 
+                "open": float(x[1]),
+
+                "high": float(x[2]),
+
+                "low": float(x[3]),
+
+                "close": float(x[4]),
+
+                "volume": float(x[5])
+
+            })
 
         return velas
-
 
     except Exception:
 
@@ -647,15 +552,11 @@ def obtener_mark_y_funding(symbol):
 
     data = binance_get(
         "/fapi/v1/premiumIndex",
-        {
-            "symbol": symbol
-        }
+        {"symbol": symbol}
     )
 
     if not data:
-
         return None, None
-
 
     try:
 
@@ -663,15 +564,11 @@ def obtener_mark_y_funding(symbol):
             data["markPrice"]
         )
 
-        funding = (
-            float(
-                data["lastFundingRate"]
-            )
-            * 100
-        )
+        funding = float(
+            data["lastFundingRate"]
+        ) * 100
 
         return mark, funding
-
 
     except Exception:
 
@@ -686,15 +583,11 @@ def obtener_open_interest(symbol):
 
     data = binance_get(
         "/fapi/v1/openInterest",
-        {
-            "symbol": symbol
-        }
+        {"symbol": symbol}
     )
 
     if not data:
-
         return None
-
 
     try:
 
@@ -717,14 +610,11 @@ def calcular_ema(
 ):
 
     if len(valores) < periodo:
-
         return None
-
 
     k = 2 / (periodo + 1)
 
     resultado = valores[0]
-
 
     for valor in valores[1:]:
 
@@ -732,7 +622,6 @@ def calcular_ema(
             valor * k
             + resultado * (1 - k)
         )
-
 
     return resultado
 
@@ -743,9 +632,7 @@ def calcular_ema_series(
 ):
 
     if not valores:
-
         return []
-
 
     k = 2 / (periodo + 1)
 
@@ -753,14 +640,12 @@ def calcular_ema_series(
         valores[0]
     ]
 
-
     for valor in valores[1:]:
 
         resultado.append(
             valor * k
             + resultado[-1] * (1 - k)
         )
-
 
     return resultado
 
@@ -775,14 +660,10 @@ def calcular_rsi(
 ):
 
     if len(cierres) < periodo + 1:
-
         return 50
 
-
     ganancias = []
-
     perdidas = []
-
 
     for i in range(
         1,
@@ -794,21 +675,17 @@ def calcular_rsi(
             - cierres[i - 1]
         )
 
-
         if cambio > 0:
 
             ganancias.append(cambio)
-
             perdidas.append(0)
 
         else:
 
             ganancias.append(0)
-
             perdidas.append(
                 abs(cambio)
             )
-
 
     promedio_ganancia = (
         sum(
@@ -824,17 +701,13 @@ def calcular_rsi(
         / periodo
     )
 
-
     if promedio_perdida == 0:
-
         return 100
-
 
     rs = (
         promedio_ganancia
         / promedio_perdida
     )
-
 
     return (
         100
@@ -846,15 +719,93 @@ def calcular_rsi(
 
 
 # ============================================================
+# STOCH RSI
+# ============================================================
+#
+# Devuelve un valor entre 0 y 100.
+#
+# 0   = muy sobrevendido
+# 100 = muy sobrecomprado
+#
+# Lo usamos junto al RSI 1H para evitar compras demasiado arriba.
+#
+# ============================================================
+
+def calcular_stoch_rsi(
+    cierres,
+    periodo_rsi=14,
+    periodo_stoch=14
+):
+
+    if len(cierres) < (
+        periodo_rsi
+        + periodo_stoch
+        + 2
+    ):
+
+        return 50
+
+    valores_rsi = []
+
+    inicio = (
+        periodo_rsi
+        + 1
+    )
+
+    for i in range(
+        inicio,
+        len(cierres) + 1
+    ):
+
+        ventana = cierres[:i]
+
+        valores_rsi.append(
+            calcular_rsi(
+                ventana,
+                periodo_rsi
+            )
+        )
+
+    if len(valores_rsi) < periodo_stoch:
+        return 50
+
+    ventana_rsi = valores_rsi[
+        -periodo_stoch:
+    ]
+
+    minimo = min(
+        ventana_rsi
+    )
+
+    maximo = max(
+        ventana_rsi
+    )
+
+    if maximo == minimo:
+        return 50
+
+    stoch_rsi = (
+        (
+            valores_rsi[-1]
+            - minimo
+        )
+        / (
+            maximo
+            - minimo
+        )
+    ) * 100
+
+    return stoch_rsi
+
+
+# ============================================================
 # MACD
 # ============================================================
 
 def calcular_macd(cierres):
 
     if len(cierres) < 35:
-
         return 0, 0
-
 
     ema12 = calcular_ema_series(
         cierres,
@@ -866,22 +817,18 @@ def calcular_macd(cierres):
         26
     )
 
-
     linea_macd = [
         a - b
-        for a, b
-        in zip(
+        for a, b in zip(
             ema12,
             ema26
         )
     ]
 
-
     señal = calcular_ema_series(
         linea_macd,
         9
     )
-
 
     return (
         linea_macd[-1],
@@ -899,12 +846,9 @@ def calcular_atr(
 ):
 
     if len(velas) < periodo + 2:
-
         return None
 
-
     tr = []
-
 
     for i in range(
         1,
@@ -912,11 +856,10 @@ def calcular_atr(
     ):
 
         actual = velas[i]
-
         anterior = velas[i - 1]
 
-
         rango = max(
+
             actual["high"]
             - actual["low"],
 
@@ -929,11 +872,10 @@ def calcular_atr(
                 actual["low"]
                 - anterior["close"]
             )
+
         )
 
-
         tr.append(rango)
-
 
     return (
         sum(
@@ -953,16 +895,11 @@ def calcular_adx(
 ):
 
     if len(velas) < periodo + 2:
-
         return 0, 0, 0
 
-
     trs = []
-
     positivos = []
-
     negativos = []
-
 
     for i in range(
         1,
@@ -970,11 +907,10 @@ def calcular_adx(
     ):
 
         actual = velas[i]
-
         anterior = velas[i - 1]
 
-
         tr = max(
+
             actual["high"]
             - actual["low"],
 
@@ -987,20 +923,18 @@ def calcular_adx(
                 actual["low"]
                 - anterior["close"]
             )
-        )
 
+        )
 
         movimiento_up = (
             actual["high"]
             - anterior["high"]
         )
 
-
         movimiento_down = (
             anterior["low"]
             - actual["low"]
         )
-
 
         plus_dm = (
             movimiento_up
@@ -1012,7 +946,6 @@ def calcular_adx(
             else 0
         )
 
-
         minus_dm = (
             movimiento_down
             if (
@@ -1023,17 +956,9 @@ def calcular_adx(
             else 0
         )
 
-
         trs.append(tr)
-
-        positivos.append(
-            plus_dm
-        )
-
-        negativos.append(
-            minus_dm
-        )
-
+        positivos.append(plus_dm)
+        negativos.append(minus_dm)
 
     tr14 = sum(
         trs[-periodo:]
@@ -1047,11 +972,8 @@ def calcular_adx(
         negativos[-periodo:]
     )
 
-
     if tr14 == 0:
-
         return 0, 0, 0
-
 
     plus_di = (
         100
@@ -1059,28 +981,19 @@ def calcular_adx(
         / tr14
     )
 
-
     minus_di = (
         100
         * minus14
         / tr14
     )
 
-
     suma = (
         plus_di
         + minus_di
     )
 
-
     if suma == 0:
-
-        return (
-            0,
-            plus_di,
-            minus_di
-        )
-
+        return 0, plus_di, minus_di
 
     dx = (
         100
@@ -1090,7 +1003,6 @@ def calcular_adx(
         )
         / suma
     )
-
 
     return (
         dx,
@@ -1106,9 +1018,7 @@ def calcular_adx(
 def calcular_vwap(velas):
 
     volumen_total = 0
-
     precio_volumen = 0
-
 
     for vela in velas[-50:]:
 
@@ -1118,9 +1028,7 @@ def calcular_vwap(velas):
             + vela["close"]
         ) / 3
 
-
         volumen = vela["volume"]
-
 
         volumen_total += volumen
 
@@ -1129,11 +1037,8 @@ def calcular_vwap(velas):
             * volumen
         )
 
-
     if volumen_total == 0:
-
         return None
-
 
     return (
         precio_volumen
@@ -1152,9 +1057,7 @@ def calcular_bollinger(
 ):
 
     if len(cierres) < periodo:
-
         return None, None, None
-
 
     sma = (
         sum(
@@ -1163,11 +1066,9 @@ def calcular_bollinger(
         / periodo
     )
 
-
     std = np.std(
         cierres[-periodo:]
     )
-
 
     banda_superior = (
         sma
@@ -1177,7 +1078,6 @@ def calcular_bollinger(
         )
     )
 
-
     banda_inferior = (
         sma
         - (
@@ -1185,7 +1085,6 @@ def calcular_bollinger(
             * desviaciones
         )
     )
-
 
     return (
         banda_superior,
@@ -1201,24 +1100,19 @@ def calcular_bollinger(
 def calcular_niveles(velas):
 
     if len(velas) < 30:
-
         return None, None
 
-
     ultimas = velas[-80:]
-
 
     soporte = min(
         x["low"]
         for x in ultimas
     )
 
-
     resistencia = max(
         x["high"]
         for x in ultimas
     )
-
 
     return (
         soporte,
@@ -1233,35 +1127,27 @@ def calcular_niveles(velas):
 def calcular_fibonacci(velas):
 
     if len(velas) < 50:
-
         return {}
 
-
     ultimas = velas[-100:]
-
 
     maximo = max(
         x["high"]
         for x in ultimas
     )
 
-
     minimo = min(
         x["low"]
         for x in ultimas
     )
-
 
     diferencia = (
         maximo
         - minimo
     )
 
-
     if diferencia <= 0:
-
         return {}
-
 
     return {
 
@@ -1280,6 +1166,7 @@ def calcular_fibonacci(velas):
         "0.786":
             maximo
             - diferencia * 0.786
+
     }
 
 
@@ -1290,12 +1177,9 @@ def calcular_fibonacci(velas):
 def calcular_ratio_volumen(velas):
 
     if len(velas) < 25:
-
         return 1
 
-
     actual = velas[-1]["volume"]
-
 
     promedio = (
         sum(
@@ -1305,11 +1189,8 @@ def calcular_ratio_volumen(velas):
         / 20
     )
 
-
     if promedio == 0:
-
         return 1
-
 
     return (
         actual
@@ -1328,26 +1209,20 @@ def determinar_tendencia(velas):
         for x in velas
     ]
 
-
     ema20 = calcular_ema(
         cierres[-80:],
         20
     )
-
 
     ema50 = calcular_ema(
         cierres[-100:],
         50
     )
 
-
     precio = cierres[-1]
 
-
     if not ema20 or not ema50:
-
         return "NEUTRAL"
-
 
     if (
         precio > ema20
@@ -1356,14 +1231,12 @@ def determinar_tendencia(velas):
 
         return "ALCISTA"
 
-
     if (
         precio < ema20
         and ema20 < ema50
     ):
 
         return "BAJISTA"
-
 
     return "NEUTRAL"
 
@@ -1375,30 +1248,23 @@ def determinar_tendencia(velas):
 def detectar_divergencia(velas):
 
     if len(velas) < 40:
-
         return None
-
 
     cierres = [
         x["close"]
         for x in velas
     ]
 
-
     rsi_anterior = calcular_rsi(
         cierres[:-10]
     )
-
 
     rsi_actual = calcular_rsi(
         cierres
     )
 
-
     precio_anterior = cierres[-10]
-
     precio_actual = cierres[-1]
-
 
     if (
         precio_actual
@@ -1409,7 +1275,6 @@ def detectar_divergencia(velas):
 
         return "ALCISTA"
 
-
     if (
         precio_actual
         > precio_anterior
@@ -1419,12 +1284,11 @@ def detectar_divergencia(velas):
 
         return "BAJISTA"
 
-
     return None
 
 
 # ============================================================
-# ANALISIS TEMPORALIDAD
+# ANALISIS DE UNA TEMPORALIDAD
 # ============================================================
 
 def analizar_temporalidad(velas):
@@ -1434,31 +1298,29 @@ def analizar_temporalidad(velas):
         for x in velas
     ]
 
-
-    macd_linea, macd_signal = (
-        calcular_macd(cierres)
+    macd_linea, macd_signal = calcular_macd(
+        cierres
     )
 
-
-    adx_value, plus_di, minus_di = (
-        calcular_adx(velas)
+    adx_value, plus_di, minus_di = calcular_adx(
+        velas
     )
 
-
-    soporte, resistencia = (
-        calcular_niveles(velas)
+    soporte, resistencia = calcular_niveles(
+        velas
     )
-
 
     atr_value = calcular_atr(
         velas
     )
 
-
-    bb_superior, bb_sma, bb_inferior = (
-        calcular_bollinger(cierres)
+    bb_superior, bb_sma, bb_inferior = calcular_bollinger(
+        cierres
     )
 
+    stoch_rsi = calcular_stoch_rsi(
+        cierres
+    )
 
     return {
 
@@ -1467,6 +1329,9 @@ def analizar_temporalidad(velas):
 
         "rsi":
             calcular_rsi(cierres),
+
+        "stoch_rsi":
+            stoch_rsi,
 
         "ema20":
             calcular_ema(
@@ -1508,9 +1373,7 @@ def analizar_temporalidad(velas):
             else 0,
 
         "vwap":
-            calcular_vwap(
-                velas
-            ),
+            calcular_vwap(velas),
 
         "soporte":
             soporte,
@@ -1546,6 +1409,7 @@ def analizar_temporalidad(velas):
 
         "bb_inferior":
             bb_inferior
+
     }
 
 
@@ -1557,7 +1421,6 @@ def analizar_moneda(symbol):
 
     resultado = {}
 
-
     temporalidades = [
         "1d",
         "4h",
@@ -1565,7 +1428,6 @@ def analizar_moneda(symbol):
         "15m",
         "5m"
     ]
-
 
     for tf in temporalidades:
 
@@ -1575,30 +1437,20 @@ def analizar_moneda(symbol):
             120
         )
 
-
         if not velas:
-
             return None
 
-
-        resultado[tf] = (
-            analizar_temporalidad(
-                velas
-            )
+        resultado[tf] = analizar_temporalidad(
+            velas
         )
-
 
         time.sleep(
             PAUSA_ENTRE_VELAS
         )
 
-
-    mark, funding = (
-        obtener_mark_y_funding(
-            symbol
-        )
+    mark, funding = obtener_mark_y_funding(
+        symbol
     )
-
 
     resultado["futures"] = {
 
@@ -1612,8 +1464,8 @@ def analizar_moneda(symbol):
 
         "funding":
             funding
-    }
 
+    }
 
     return resultado
 
@@ -1628,20 +1480,14 @@ def seleccionar_monedas():
         "Seleccionando monedas..."
     )
 
-
     contratos = obtener_contratos()
 
-
     if not contratos:
-
         return []
-
 
     volumenes = obtener_volumenes()
 
-
     candidatos = []
-
 
     for symbol in contratos:
 
@@ -1650,11 +1496,8 @@ def seleccionar_monedas():
             0
         )
 
-
         if volumen < 20_000_000:
-
             continue
-
 
         velas = obtener_velas(
             symbol,
@@ -1662,36 +1505,26 @@ def seleccionar_monedas():
             80
         )
 
-
         if not velas:
-
             continue
-
 
         atr_value = calcular_atr(
             velas
         )
 
-
         if not atr_value:
-
             continue
-
 
         precio = velas[-1]["close"]
 
-
         if precio <= 0:
-
             continue
-
 
         volatilidad = (
             atr_value
             / precio
             * 100
         )
-
 
         candidatos.append({
 
@@ -1703,50 +1536,40 @@ def seleccionar_monedas():
 
             "volumen":
                 volumen
-        })
 
+        })
 
         time.sleep(
             PAUSA_ENTRE_SELECCION
         )
 
-
     if not candidatos:
-
         return []
-
 
     candidatos.sort(
         key=lambda x:
-        x["volatilidad"]
+            x["volatilidad"]
     )
-
 
     tranquilas = candidatos[
         :MONEDAS_BAJA_VOLATILIDAD
     ]
 
-
     volatiles = candidatos[
         -MONEDAS_ALTA_VOLATILIDAD:
     ]
-
 
     seleccionadas = (
         tranquilas
         + volatiles
     )
 
-
     resultado = []
-
     vistos = set()
-
 
     for x in seleccionadas:
 
         symbol = x["symbol"]
-
 
         if symbol not in vistos:
 
@@ -1756,12 +1579,10 @@ def seleccionar_monedas():
                 symbol
             )
 
-
     print(
         "Monedas seleccionadas:",
         len(resultado)
     )
-
 
     return resultado[
         :TOTAL_MONEDAS
@@ -1775,23 +1596,12 @@ def seleccionar_monedas():
 def calcular_confluencia(data):
 
     long_score = 0
-
     short_score = 0
 
-
     long_motivos = []
-
     short_motivos = []
 
-
-    # --------------------------------------------------------
-    # 1D
-    # --------------------------------------------------------
-
-    if (
-        data["1d"]["tendencia"]
-        == "ALCISTA"
-    ):
+    if data["1d"]["tendencia"] == "ALCISTA":
 
         long_score += 2
 
@@ -1799,11 +1609,7 @@ def calcular_confluencia(data):
             "Tendencia 1D alcista"
         )
 
-
-    elif (
-        data["1d"]["tendencia"]
-        == "BAJISTA"
-    ):
+    elif data["1d"]["tendencia"] == "BAJISTA":
 
         short_score += 2
 
@@ -1811,15 +1617,7 @@ def calcular_confluencia(data):
             "Tendencia 1D bajista"
         )
 
-
-    # --------------------------------------------------------
-    # 4H
-    # --------------------------------------------------------
-
-    if (
-        data["4h"]["tendencia"]
-        == "ALCISTA"
-    ):
+    if data["4h"]["tendencia"] == "ALCISTA":
 
         long_score += 2
 
@@ -1827,11 +1625,7 @@ def calcular_confluencia(data):
             "Estructura 4H alcista"
         )
 
-
-    elif (
-        data["4h"]["tendencia"]
-        == "BAJISTA"
-    ):
+    elif data["4h"]["tendencia"] == "BAJISTA":
 
         short_score += 2
 
@@ -1839,13 +1633,7 @@ def calcular_confluencia(data):
             "Estructura 4H bajista"
         )
 
-
-    # --------------------------------------------------------
-    # RSI 1H
-    # --------------------------------------------------------
-
     rsi = data["1h"]["rsi"]
-
 
     if rsi <= 40:
 
@@ -1855,7 +1643,6 @@ def calcular_confluencia(data):
             f"RSI 1H bajo ({rsi:.1f})"
         )
 
-
     elif rsi >= 60:
 
         short_score += 1
@@ -1864,15 +1651,7 @@ def calcular_confluencia(data):
             f"RSI 1H alto ({rsi:.1f})"
         )
 
-
-    # --------------------------------------------------------
-    # DIVERGENCIA
-    # --------------------------------------------------------
-
-    divergencia = (
-        data["1h"]["divergencia"]
-    )
-
+    divergencia = data["1h"]["divergencia"]
 
     if divergencia == "ALCISTA":
 
@@ -1882,7 +1661,6 @@ def calcular_confluencia(data):
             "Divergencia RSI alcista"
         )
 
-
     elif divergencia == "BAJISTA":
 
         short_score += 1
@@ -1891,17 +1669,8 @@ def calcular_confluencia(data):
             "Divergencia RSI bajista"
         )
 
-
-    # --------------------------------------------------------
-    # MACD
-    # --------------------------------------------------------
-
     macd = data["1h"]["macd"]
-
-    macd_signal = (
-        data["1h"]["macd_signal"]
-    )
-
+    macd_signal = data["1h"]["macd_signal"]
 
     if macd > macd_signal:
 
@@ -1911,7 +1680,6 @@ def calcular_confluencia(data):
             "MACD 1H alcista"
         )
 
-
     elif macd < macd_signal:
 
         short_score += 1
@@ -1920,17 +1688,11 @@ def calcular_confluencia(data):
             "MACD 1H bajista"
         )
 
-
-    # --------------------------------------------------------
-    # ADX
-    # --------------------------------------------------------
-
     adx = data["1h"]["adx"]
 
     plus_di = data["1h"]["plus_di"]
 
     minus_di = data["1h"]["minus_di"]
-
 
     if adx >= 20:
 
@@ -1942,7 +1704,6 @@ def calcular_confluencia(data):
                 f"ADX fuerte ({adx:.1f})"
             )
 
-
         elif minus_di > plus_di:
 
             short_score += 1
@@ -1951,15 +1712,7 @@ def calcular_confluencia(data):
                 f"ADX fuerte ({adx:.1f})"
             )
 
-
-    # --------------------------------------------------------
-    # VOLUMEN
-    # --------------------------------------------------------
-
-    volumen = (
-        data["15m"]["volumen_ratio"]
-    )
-
+    volumen = data["15m"]["volumen_ratio"]
 
     if volumen >= 1.30:
 
@@ -1971,7 +1724,6 @@ def calcular_confluencia(data):
                 f"Volumen elevado ({volumen:.1f}x)"
             )
 
-
         elif short_score > long_score:
 
             short_score += 1
@@ -1980,15 +1732,9 @@ def calcular_confluencia(data):
                 f"Volumen elevado ({volumen:.1f}x)"
             )
 
-
-    # --------------------------------------------------------
-    # VWAP
-    # --------------------------------------------------------
-
     precio = data["1h"]["precio"]
 
     vwap = data["1h"]["vwap"]
-
 
     if vwap:
 
@@ -2000,7 +1746,6 @@ def calcular_confluencia(data):
                 "Precio sobre VWAP"
             )
 
-
         elif precio < vwap:
 
             short_score += 1
@@ -2008,11 +1753,6 @@ def calcular_confluencia(data):
             short_motivos.append(
                 "Precio bajo VWAP"
             )
-
-
-    # --------------------------------------------------------
-    # RESULTADO
-    # --------------------------------------------------------
 
     if (
         long_score >= MIN_SCORE
@@ -2025,7 +1765,6 @@ def calcular_confluencia(data):
             long_motivos
         )
 
-
     if (
         short_score >= MIN_SCORE
         and short_score > long_score
@@ -2036,7 +1775,6 @@ def calcular_confluencia(data):
             short_score,
             short_motivos
         )
-
 
     return (
         None,
@@ -2067,14 +1805,10 @@ def buscar_zona(
 
     atr_value = data["4h"]["atr"]
 
-
     if not atr_value:
-
         return None
 
-
     niveles = []
-
 
     if direccion == "LONG":
 
@@ -2087,7 +1821,6 @@ def buscar_zona(
                 soporte
             )
 
-
         for nombre in [
             "0.618",
             "0.786"
@@ -2096,7 +1829,6 @@ def buscar_zona(
             nivel = fibonacci.get(
                 nombre
             )
-
 
             if (
                 nivel
@@ -2107,9 +1839,7 @@ def buscar_zona(
                     nivel
                 )
 
-
         vwap = data["4h"]["vwap"]
-
 
         if (
             vwap
@@ -2120,16 +1850,12 @@ def buscar_zona(
                 vwap
             )
 
-
         if not niveles:
-
             return None
-
 
         nivel = max(
             niveles
         )
-
 
     else:
 
@@ -2142,7 +1868,6 @@ def buscar_zona(
                 resistencia
             )
 
-
         for nombre in [
             "0.382",
             "0.500",
@@ -2153,7 +1878,6 @@ def buscar_zona(
                 nombre
             )
 
-
             if (
                 nivel
                 and nivel > precio
@@ -2163,9 +1887,7 @@ def buscar_zona(
                     nivel
                 )
 
-
         vwap = data["4h"]["vwap"]
-
 
         if (
             vwap
@@ -2176,26 +1898,14 @@ def buscar_zona(
                 vwap
             )
 
-
         if not niveles:
-
             return None
-
 
         nivel = min(
             niveles
         )
 
-
-    # --------------------------------------------------------
-    # ANCHO DE LA ZONA
-    # --------------------------------------------------------
-
-    ancho = (
-        atr_value
-        * 0.30
-    )
-
+    ancho = atr_value * 0.30
 
     return (
         nivel - ancho,
@@ -2205,7 +1915,7 @@ def buscar_zona(
 
 
 # ============================================================
-# ¿ESTÁ CERCA DE LA ZONA?
+# ¿ESTA CERCA DE LA ZONA?
 # ============================================================
 
 def esta_cerca(
@@ -2223,7 +1933,6 @@ def esta_cerca(
 
         return True
 
-
     if precio > zona_max:
 
         distancia = (
@@ -2237,7 +1946,6 @@ def esta_cerca(
             zona_min
             - precio
         )
-
 
     return (
         abs(distancia)
@@ -2254,130 +1962,15 @@ def hay_momentum_minimo(data):
 
     adx = data["5m"]["adx"]
 
-    volumen = (
-        data["5m"]["volumen_ratio"]
-    )
-
+    volumen = data["5m"]["volumen_ratio"]
 
     if adx < UMBRAL_ADX_MINIMO_5M:
-
         return False
-
 
     if volumen < UMBRAL_VOLUMEN_MINIMO_5M:
-
         return False
-
 
     return True
-
-
-# ============================================================
-# CONFIRMACION EXTRA 5M
-# ============================================================
-
-def confirmar_entrada(
-    data,
-    direccion,
-    zona_min,
-    zona_max
-):
-
-    precio = data["5m"]["precio"]
-
-    atr_value = data["5m"]["atr"]
-
-
-    if not atr_value:
-
-        return False
-
-
-    margen = (
-        atr_value
-        * 0.50
-    )
-
-
-    cerca = (
-        zona_min - margen
-        <= precio
-        <= zona_max + margen
-    )
-
-
-    if not cerca:
-
-        return False
-
-
-    rsi = data["5m"]["rsi"]
-
-    macd = data["5m"]["macd"]
-
-    macd_signal = (
-        data["5m"]["macd_signal"]
-    )
-
-    adx = data["5m"]["adx"]
-
-    plus_di = data["5m"]["plus_di"]
-
-    minus_di = data["5m"]["minus_di"]
-
-    volumen = (
-        data["5m"]["volumen_ratio"]
-    )
-
-
-    if adx < 18:
-
-        return False
-
-
-    if volumen < 0.90:
-
-        return False
-
-
-    if direccion == "LONG":
-
-        if rsi > 68:
-
-            return False
-
-
-        if macd <= macd_signal:
-
-            return False
-
-
-        if plus_di <= minus_di:
-
-            return False
-
-
-        return True
-
-
-    else:
-
-        if rsi < 32:
-
-            return False
-
-
-        if macd >= macd_signal:
-
-            return False
-
-
-        if minus_di <= plus_di:
-
-            return False
-
-
-        return True
 
 
 # ============================================================
@@ -2392,16 +1985,11 @@ def calcular_apalancamiento(
 
     leverage = 5
 
-
     if score >= 8:
-
         leverage = 6
 
-
     if score >= 9:
-
         leverage = 7
-
 
     if (
         score >= 9
@@ -2411,7 +1999,6 @@ def calcular_apalancamiento(
 
         leverage = 8
 
-
     if (
         score >= 10
         and adx >= 30
@@ -2419,7 +2006,6 @@ def calcular_apalancamiento(
     ):
 
         leverage = 10
-
 
     return max(
         MIN_LEVERAGE,
@@ -2431,24 +2017,20 @@ def calcular_apalancamiento(
 
 
 # ============================================================
-# NUEVO STOP LOSS / TP
+# TP Y STOP
 # ============================================================
 #
-# ESTA ES LA PARTE PRINCIPAL CORREGIDA.
+# CAMBIO IMPORTANTE:
 #
-# El Stop ya NO queda pegado a la entrada.
+# Para LONG:
 #
-# LONG:
-#   - mínimo 1.80 ATR
-#   - intenta colocarse debajo del soporte
-#   - deja un pequeño margen debajo del soporte
-#   - máximo aproximado 3 ATR
+# stop_loss =
+# min(zona_baja, low_20_velas) * 0.995
 #
-# SHORT:
-#   - mínimo 1.80 ATR
-#   - intenta colocarse encima de resistencia
-#   - deja un pequeño margen encima de resistencia
-#   - máximo aproximado 3 ATR
+# Esto coloca el stop 0,5% debajo del nivel más bajo.
+#
+# Para SHORT NO usamos esa fórmula porque daría un stop por
+# debajo del precio, lo cual sería incorrecto.
 #
 # ============================================================
 
@@ -2456,289 +2038,99 @@ def calcular_tp_sl(
     precio,
     atr_value,
     direccion,
-    data=None,
-    zona=None
+    zona_baja=None,
+    low_20_velas=None
 ):
 
-    if (
-        not atr_value
-        or precio <= 0
-    ):
-
-        return (
-            None,
-            None,
-            None
-        )
-
-
-    # --------------------------------------------------------
-    # DISTANCIAS DEL STOP
-    # --------------------------------------------------------
-
-    STOP_MIN_ATR = 1.80
-
-    STOP_MAX_ATR = 3.00
-
-    STOP_BUFFER_ATR = 0.20
-
-
-    stop_minimo = (
-        atr_value
-        * STOP_MIN_ATR
+    tp1_distancia = (
+        atr_value * 1.50
     )
 
-
-    stop_maximo = (
-        atr_value
-        * STOP_MAX_ATR
+    tp2_distancia = (
+        atr_value * 2.50
     )
-
-
-    stop_buffer = (
-        atr_value
-        * STOP_BUFFER_ATR
-    )
-
-
-    # --------------------------------------------------------
-    # NIVELES
-    # --------------------------------------------------------
-
-    soporte = None
-
-    resistencia = None
-
-
-    if data:
-
-        try:
-
-            soporte = (
-                data["4h"]
-                .get("soporte")
-            )
-
-            resistencia = (
-                data["4h"]
-                .get("resistencia")
-            )
-
-        except Exception:
-
-            pass
-
-
-    # ========================================================
-    # LONG
-    # ========================================================
 
     if direccion == "LONG":
 
-        stop_tecnico = None
-
-
-        # -----------------------------------------------
-        # Intentar colocar el stop debajo del soporte
-        # -----------------------------------------------
+        # ----------------------------------------------------
+        # NUEVO STOP LOSS LONG
+        # ----------------------------------------------------
 
         if (
-            soporte
-            and soporte < precio
+            zona_baja is not None
+            and low_20_velas is not None
         ):
 
-            candidato = (
-                soporte
-                - stop_buffer
-            )
-
-
-            distancia = (
-                precio
-                - candidato
-            )
-
-
-            # Solo usamos el soporte si no queda
-            # demasiado lejos.
-            if (
-                distancia >= stop_minimo
-                and distancia <= stop_maximo
-            ):
-
-                stop_tecnico = candidato
-
-
-        # -----------------------------------------------
-        # Si soporte está demasiado lejos,
-        # usamos un Stop por ATR.
-        # -----------------------------------------------
-
-        if stop_tecnico is None:
-
-            stop_tecnico = (
-                precio
-                - (
-                    atr_value
-                    * 2.20
+            stop_loss = (
+                min(
+                    zona_baja,
+                    low_20_velas
                 )
+                * 0.995
             )
 
+        elif zona_baja is not None:
 
-        # -----------------------------------------------
-        # Seguridad mínima
-        # -----------------------------------------------
+            stop_loss = (
+                zona_baja
+                * 0.995
+            )
 
-        if (
-            precio - stop_tecnico
-            < stop_minimo
-        ):
+        elif low_20_velas is not None:
 
-            stop_tecnico = (
+            stop_loss = (
+                low_20_velas
+                * 0.995
+            )
+
+        else:
+
+            # Fallback por seguridad
+            stop_loss = (
                 precio
-                - stop_minimo
+                - atr_value * 1.35
             )
-
-
-        # -----------------------------------------------
-        # Seguridad máxima
-        # -----------------------------------------------
-
-        if (
-            precio - stop_tecnico
-            > stop_maximo
-        ):
-
-            stop_tecnico = (
-                precio
-                - stop_maximo
-            )
-
-
-        stop = stop_tecnico
-
-
-        # -----------------------------------------------
-        # TAKE PROFITS
-        # -----------------------------------------------
 
         tp1 = (
             precio
-            + atr_value * 1.50
+            + tp1_distancia
         )
-
 
         tp2 = (
             precio
-            + atr_value * 2.80
+            + tp2_distancia
         )
-
-
-    # ========================================================
-    # SHORT
-    # ========================================================
 
     else:
 
-        stop_tecnico = None
+        # ----------------------------------------------------
+        # STOP SHORT
+        # ----------------------------------------------------
+        #
+        # Para SHORT mantenemos un stop por encima del precio.
+        #
 
+        stop_distancia = (
+            atr_value * 1.35
+        )
 
-        # -----------------------------------------------
-        # Intentar colocar el stop encima de resistencia
-        # -----------------------------------------------
-
-        if (
-            resistencia
-            and resistencia > precio
-        ):
-
-            candidato = (
-                resistencia
-                + stop_buffer
-            )
-
-
-            distancia = (
-                candidato
-                - precio
-            )
-
-
-            if (
-                distancia >= stop_minimo
-                and distancia <= stop_maximo
-            ):
-
-                stop_tecnico = candidato
-
-
-        # -----------------------------------------------
-        # Si resistencia está demasiado lejos,
-        # usamos ATR.
-        # -----------------------------------------------
-
-        if stop_tecnico is None:
-
-            stop_tecnico = (
-                precio
-                + (
-                    atr_value
-                    * 2.20
-                )
-            )
-
-
-        # -----------------------------------------------
-        # Seguridad mínima
-        # -----------------------------------------------
-
-        if (
-            stop_tecnico - precio
-            < stop_minimo
-        ):
-
-            stop_tecnico = (
-                precio
-                + stop_minimo
-            )
-
-
-        # -----------------------------------------------
-        # Seguridad máxima
-        # -----------------------------------------------
-
-        if (
-            stop_tecnico - precio
-            > stop_maximo
-        ):
-
-            stop_tecnico = (
-                precio
-                + stop_maximo
-            )
-
-
-        stop = stop_tecnico
-
-
-        # -----------------------------------------------
-        # TAKE PROFITS
-        # -----------------------------------------------
+        stop_loss = (
+            precio
+            + stop_distancia
+        )
 
         tp1 = (
             precio
-            - atr_value * 1.50
+            - tp1_distancia
         )
-
 
         tp2 = (
             precio
-            - atr_value * 2.80
+            - tp2_distancia
         )
 
-
     return (
-        stop,
+        stop_loss,
         tp1,
         tp2
     )
@@ -2763,12 +2155,10 @@ def calcular_ganancia(
         * 100
     )
 
-
     resultado_bruto = (
         movimiento
         * leverage
     )
-
 
     comision_total = (
         COMISION_TAKER_POR_LADO
@@ -2776,12 +2166,10 @@ def calcular_ganancia(
         * leverage
     )
 
-
     resultado_neto = (
         resultado_bruto
         - comision_total
     )
-
 
     return (
         movimiento,
@@ -2800,22 +2188,19 @@ def precio_texto(precio):
 
         return f"{precio:,.2f}"
 
-
     if precio >= 1:
 
         return f"{precio:,.4f}"
-
 
     if precio >= 0.01:
 
         return f"{precio:.6f}"
 
-
     return f"{precio:.10f}"
 
 
 # ============================================================
-# MANDAR ORDEN
+# ENVIAR ORDEN
 # ============================================================
 
 def mandar_orden_compra(
@@ -2829,51 +2214,56 @@ def mandar_orden_compra(
 
     zona_min, zona_max, nivel = zona
 
-
     precio = data["5m"]["precio"]
 
-
-    # Usamos ATR 1H para calcular riesgo
     atr_value = data["1h"]["atr"]
 
-
     if not atr_value:
-
         return None
 
+    # ========================================================
+    # MINIMO DE LAS ULTIMAS 20 VELAS
+    # ========================================================
 
-    # --------------------------------------------------------
-    # STOP / TP CORREGIDOS
-    # --------------------------------------------------------
+    # Usamos las velas 4H porque la zona de entrada también
+    # se calcula principalmente sobre estructura 4H.
 
-    stop, tp1, tp2 = calcular_tp_sl(
-        precio,
-        atr_value,
-        direccion,
-        data,
-        zona
+    velas_4h = obtener_velas(
+        symbol,
+        "4h",
+        30
     )
 
-
-    if (
-        stop is None
-        or tp1 is None
-        or tp2 is None
-    ):
+    if not velas_4h:
 
         return None
 
+    low_20_velas = min(
+        vela["low"]
+        for vela in velas_4h[-20:]
+    )
 
-    # --------------------------------------------------------
-    # APALANCAMIENTO
-    # --------------------------------------------------------
+    # ========================================================
+    # CALCULAR STOP / TP
+    # ========================================================
+
+    stop, tp1, tp2 = calcular_tp_sl(
+
+        precio,
+
+        atr_value,
+
+        direccion,
+
+        zona_baja=zona_min,
+
+        low_20_velas=low_20_velas
+
+    )
 
     adx = data["1h"]["adx"]
 
-    volatilidad = (
-        data["1h"]["atr_pct"]
-    )
-
+    volatilidad = data["1h"]["atr_pct"]
 
     leverage = calcular_apalancamiento(
         score,
@@ -2881,19 +2271,11 @@ def mandar_orden_compra(
         volatilidad
     )
 
-
-    # --------------------------------------------------------
-    # GANANCIA
-    # --------------------------------------------------------
-
-    movimiento, bruto, neto = (
-        calcular_ganancia(
-            precio,
-            tp2,
-            leverage
-        )
+    movimiento, bruto, neto = calcular_ganancia(
+        precio,
+        tp2,
+        leverage
     )
-
 
     if neto < MIN_GANANCIA_NETA:
 
@@ -2905,20 +2287,9 @@ def mandar_orden_compra(
 
         return None
 
+    funding = data["futures"]["funding"]
 
-    # --------------------------------------------------------
-    # DATOS FUTUROS
-    # --------------------------------------------------------
-
-    funding = (
-        data["futures"]["funding"]
-    )
-
-
-    open_interest = (
-        data["futures"]["open_interest"]
-    )
-
+    open_interest = data["futures"]["open_interest"]
 
     funding_text = (
         "N/D"
@@ -2926,13 +2297,11 @@ def mandar_orden_compra(
         else f"{funding:.4f}%"
     )
 
-
     oi_text = (
         "N/D"
         if open_interest is None
         else f"{open_interest:,.2f}"
     )
-
 
     # ========================================================
     # URGENCIA
@@ -2944,84 +2313,65 @@ def mandar_orden_compra(
         <= zona_max
     )
 
-
     atr_5m = data["5m"]["atr"]
-
 
     if dentro_zona:
 
         urgencia_texto = (
-            "⏱️ YA ESTÁ DENTRO de la zona."
+            "⏱️ YA ESTÁ DENTRO de la zona ahora mismo."
         )
-
 
     elif atr_5m:
 
         distancia_precio = (
-            precio - zona_max
-            if precio > zona_max
-            else zona_min - precio
-        )
 
+            precio - zona_max
+
+            if precio > zona_max
+
+            else zona_min - precio
+
+        )
 
         velas_estimadas = (
             distancia_precio
             / atr_5m
         )
 
-
         minutos_estimados = (
             velas_estimadas
             * 5
         )
 
-
         urgencia_texto = (
+
             "⏱️ Todavía se está acercando — "
-            f"~{minutos_estimados:.0f} min "
-            "estimados hasta tocar la zona. "
-            "No es una garantía."
-        )
+            f"unos ~{minutos_estimados:.0f} min "
+            "estimados hasta tocar la zona."
 
+        )
 
     else:
 
         urgencia_texto = (
-            "⏱️ Todavía se está acercando "
-            "a la zona."
+            "⏱️ Todavía se está acercando a la zona."
         )
 
-
     # ========================================================
-    # TÍTULO
-    # ========================================================
-
-    if direccion == "LONG":
-
-        titulo = (
-            "🟢 ORDEN DE COMPRA (LONG)"
-        )
-
-    else:
-
-        titulo = (
-            "🔴 ORDEN DE VENTA (SHORT)"
-        )
-
-
-    # ========================================================
-    # DISTANCIA STOP
+    # TITULO
     # ========================================================
 
-    distancia_stop = (
-        abs(
-            precio
-            - stop
-        )
-        / precio
-        * 100
+    titulo = (
+
+        "🟢 ORDEN DE COMPRA (LONG)"
+
+        if direccion == "LONG"
+
+        else
+
+        "🔴 ORDEN DE VENTA (SHORT)"
+
     )
-
 
     # ========================================================
     # MENSAJE
@@ -3048,10 +2398,10 @@ def mandar_orden_compra(
         f"{precio_texto(tp2)}\n"
 
         f"🛑 STOP: "
-        f"{precio_texto(stop)}\n"
+        f"{precio_texto(stop)}\n\n"
 
-        f"📏 Distancia Stop: "
-        f"{distancia_stop:.2f}%\n\n"
+        f"📉 MÍNIMO 20 VELAS 4H: "
+        f"{precio_texto(low_20_velas)}\n\n"
 
         f"⚡ APALANCAMIENTO: "
         f"x{leverage}\n"
@@ -3061,6 +2411,9 @@ def mandar_orden_compra(
 
         f"📊 RSI 1H: "
         f"{data['1h']['rsi']:.1f}\n"
+
+        f"📊 STOCH RSI 1H: "
+        f"{data['1h']['stoch_rsi']:.1f}\n"
 
         f"📊 ADX 1H: "
         f"{adx:.1f}\n"
@@ -3080,8 +2433,7 @@ def mandar_orden_compra(
         f"💰 Resultado bruto: "
         f"+{bruto:.2f}%\n"
 
-        f"💸 Comisión estimada "
-        f"(x{leverage}): "
+        f"💸 Comisión estimada (x{leverage}): "
         f"-{COMISION_TAKER_POR_LADO * 2 * leverage:.2f}%\n"
 
         f"✅ Resultado neto: "
@@ -3090,8 +2442,9 @@ def mandar_orden_compra(
         "👤 OPERACIÓN MANUAL — "
         "el bot NO compra ni vende.\n"
 
-        "⚠️ La señal llega con anticipación. "
-        "El precio puede moverse antes de ejecutar.\n\n"
+        "⚠️ Llega CON ANTICIPACIÓN: "
+        "el precio puede seguir moviéndose "
+        "antes de que operes.\n\n"
 
         "📊 Motivos:\n"
 
@@ -3099,13 +2452,12 @@ def mandar_orden_compra(
             "• " + m
             for m in motivos
         )
-    )
 
+    )
 
     enviar_telegram(
         mensaje
     )
-
 
     return (
         precio,
@@ -3127,47 +2479,76 @@ def procesar_moneda(symbol):
             symbol
         )
 
-
         if not data:
+            return
+
+        # ====================================================
+        # NUEVO FILTRO DE SOBRECOMPRA
+        # ====================================================
+        #
+        # Equivalente funcional a:
+        #
+        # if rsi > 75 or stoch_rsi > 85:
+        #     continue
+        #
+        # Como esta función analiza UNA moneda, usamos return.
+        #
+        # ====================================================
+
+        rsi = data["1h"]["rsi"]
+
+        stoch_rsi = data["1h"]["stoch_rsi"]
+
+        if (
+            rsi > RSI_MAXIMO_COMPRA
+            or
+            stoch_rsi > STOCH_RSI_MAXIMO_COMPRA
+        ):
+
+            print(
+                symbol,
+                "descartada por sobrecompra:",
+                f"RSI={rsi:.1f}",
+                f"StochRSI={stoch_rsi:.1f}"
+            )
 
             return
 
+        # ====================================================
+        # CONFLUENCIA
+        # ====================================================
 
-        direccion, score, motivos = (
-            calcular_confluencia(
-                data
-            )
+        direccion, score, motivos = calcular_confluencia(
+            data
         )
 
-
         if not direccion:
-
             return
 
+        # ====================================================
+        # ZONA
+        # ====================================================
 
         zona = buscar_zona(
             data,
             direccion
         )
 
-
         if not zona:
-
             return
 
-
         zona_min, zona_max, nivel = zona
-
 
         precio = data["5m"]["precio"]
 
         atr_value = data["4h"]["atr"]
 
-
         if not atr_value:
-
             return
 
+        # ====================================================
+        # CERCANIA
+        # ====================================================
 
         cerca = esta_cerca(
             precio,
@@ -3176,76 +2557,64 @@ def procesar_moneda(symbol):
             atr_value
         )
 
-
         if not cerca:
-
             return
 
-
-        # ----------------------------------------------------
+        # ====================================================
         # MOMENTUM
-        # ----------------------------------------------------
+        # ====================================================
 
-        if not hay_momentum_minimo(
-            data
-        ):
+        if not hay_momentum_minimo(data):
+
+            print(
+                symbol,
+                "cerca de zona pero sin momentum suficiente."
+            )
 
             return
 
-
-        # ----------------------------------------------------
-        # EVITAR REPETIR SEÑAL
-        # ----------------------------------------------------
+        # ====================================================
+        # EVITAR DUPLICADOS
+        # ====================================================
 
         with señales_lock:
 
-            señal_actual = (
-                señales_activas.get(
-                    symbol
-                )
+            señal_actual = señales_activas.get(
+                symbol
             )
-
 
         debe_enviar = (
 
             not señal_actual
 
-            or señal_actual.get(
+            or
+
+            señal_actual.get(
                 "direccion"
-            )
-            != direccion
+            ) != direccion
+
         )
 
-
         if not debe_enviar:
-
             return
 
-
-        # ----------------------------------------------------
-        # MANDAR SEÑAL
-        # ----------------------------------------------------
+        # ====================================================
+        # MANDAR ORDEN
+        # ====================================================
 
         resultado = mandar_orden_compra(
 
             symbol,
-
             data,
-
             direccion,
-
             score,
-
             motivos,
-
             zona
+
         )
 
-
         if not resultado:
-
             return
-
 
         (
             precio_entrada,
@@ -3254,10 +2623,9 @@ def procesar_moneda(symbol):
             tp2
         ) = resultado
 
-
-        # ----------------------------------------------------
+        # ====================================================
         # GUARDAR SEÑAL
-        # ----------------------------------------------------
+        # ====================================================
 
         with señales_lock:
 
@@ -3283,11 +2651,10 @@ def procesar_moneda(symbol):
 
                 "estado":
                     "esperando_tp1"
+
             }
 
-
         guardar_estado()
-
 
     except Exception as e:
 
@@ -3316,8 +2683,8 @@ def vigilar_señales_activas():
             in señales_activas.items()
 
             if señal.get("estado")
-        }
 
+        }
 
     for symbol, señal in copia.items():
 
@@ -3327,47 +2694,32 @@ def vigilar_señales_activas():
             1
         )
 
-
         if not velas:
-
             continue
-
 
         precio_actual = (
             velas[-1]["close"]
         )
 
-
-        direccion = (
-            señal.get(
-                "direccion"
-            )
+        direccion = señal.get(
+            "direccion"
         )
-
 
         tp1 = señal.get(
             "tp1"
         )
 
-
         tp2 = señal.get(
             "tp2"
         )
 
-
-        precio_entrada = (
-            señal.get(
-                "precio_entrada"
-            )
+        precio_entrada = señal.get(
+            "precio_entrada"
         )
 
-
-        estado = (
-            señal.get(
-                "estado"
-            )
+        estado = señal.get(
+            "estado"
         )
-
 
         if (
             tp1 is None
@@ -3376,11 +2728,6 @@ def vigilar_señales_activas():
         ):
 
             continue
-
-
-        # ----------------------------------------------------
-        # TP1
-        # ----------------------------------------------------
 
         alcanzo_tp1 = (
 
@@ -3395,12 +2742,8 @@ def vigilar_señales_activas():
                 direccion == "SHORT"
                 and precio_actual <= tp1
             )
+
         )
-
-
-        # ----------------------------------------------------
-        # TP2
-        # ----------------------------------------------------
 
         alcanzo_tp2 = (
 
@@ -3415,12 +2758,8 @@ def vigilar_señales_activas():
                 direccion == "SHORT"
                 and precio_actual <= tp2
             )
+
         )
-
-
-        # ----------------------------------------------------
-        # AVISO TP1
-        # ----------------------------------------------------
 
         if (
             estado == "esperando_tp1"
@@ -3430,13 +2769,13 @@ def vigilar_señales_activas():
             enviar_telegram(
 
                 f"🔥 {symbol} alcanzó TP1 "
-                f"({precio_texto(tp1)}).\n\n"
+                f"({precio_texto(tp1)}).\n"
 
-                f"🛡️ Sugerencia: mové tu "
-                f"Stop Loss al precio de entrada "
+                f"🛡️ Sugerencia: mové tu Stop Loss "
+                f"al precio de entrada "
                 f"({precio_texto(precio_entrada)})."
-            )
 
+            )
 
             with señales_lock:
 
@@ -3444,17 +2783,11 @@ def vigilar_señales_activas():
 
                     señales_activas[
                         symbol
-                    ]["estado"] = (
-                        "esperando_tp2"
-                    )
-
+                    ][
+                        "estado"
+                    ] = "esperando_tp2"
 
             guardar_estado()
-
-
-        # ----------------------------------------------------
-        # AVISO TP2
-        # ----------------------------------------------------
 
         elif (
             estado == "esperando_tp2"
@@ -3464,11 +2797,11 @@ def vigilar_señales_activas():
             enviar_telegram(
 
                 f"🚀 {symbol} alcanzó TP2 "
-                f"({precio_texto(tp2)}).\n\n"
+                f"({precio_texto(tp2)}).\n"
 
                 "✅ Operación completada."
-            )
 
+            )
 
             with señales_lock:
 
@@ -3477,16 +2810,14 @@ def vigilar_señales_activas():
                     None
                 )
 
-
             guardar_estado()
 
 
 # ============================================================
-# REPORTE DIARIO 09:30 ARGENTINA
+# REPORTE DIARIO
 # ============================================================
 
 HORA_REPORTE_DIARIO = 9
-
 MINUTO_REPORTE_DIARIO = 30
 
 
@@ -3494,67 +2825,39 @@ def reporte_diario_estado():
 
     ya_enviado_hoy = False
 
-
-    zona_argentina = ZoneInfo(
-        "America/Argentina/Buenos_Aires"
-    )
-
-
     while True:
 
-        try:
+        ahora = datetime.datetime.now()
 
-            ahora = (
-                datetime.datetime.now(
-                    zona_argentina
+        if (
+            ahora.hour
+            == HORA_REPORTE_DIARIO
+
+            and
+
+            ahora.minute
+            == MINUTO_REPORTE_DIARIO
+        ):
+
+            if not ya_enviado_hoy:
+
+                enviar_telegram(
+
+                    "✅ TU BOT ESTÁ FUNCIONANDO\n\n"
+                    "🤖 Bot de futuros activo.\n"
+                    "📊 Escaneando el mercado.\n"
+                    "🟢 LONG / 🔴 SHORT\n"
+                    "⏰ Control diario 09:30."
+
                 )
-            )
 
+                ya_enviado_hoy = True
 
-            if (
-                ahora.hour
-                == HORA_REPORTE_DIARIO
+        else:
 
-                and
+            ya_enviado_hoy = False
 
-                ahora.minute
-                == MINUTO_REPORTE_DIARIO
-            ):
-
-                if not ya_enviado_hoy:
-
-                    enviar_telegram(
-
-                        "🟢 TU BOT ESTÁ FUNCIONANDO\n\n"
-
-                        "🤖 El bot de futuros está "
-                        "activo y analizando el mercado.\n\n"
-
-                        "📊 Binance Futures\n"
-                        "⏱️ 1D / 4H / 1H / 15M / 5M\n"
-                        "🟢 LONG / 🔴 SHORT\n\n"
-
-                        "🇦🇷 Reporte diario — 09:30"
-                    )
-
-
-                    ya_enviado_hoy = True
-
-
-            else:
-
-                ya_enviado_hoy = False
-
-
-        except Exception as e:
-
-            print(
-                "Error reporte diario:",
-                e
-            )
-
-
-        time.sleep(20)
+        time.sleep(30)
 
 
 # ============================================================
@@ -3566,7 +2869,6 @@ def limpiar_señales():
     ahora = time.time()
 
     hubo_cambios = False
-
 
     with señales_lock:
 
@@ -3585,8 +2887,8 @@ def limpiar_señales():
                 )
                 > 21600
             )
-        ]
 
+        ]
 
         for symbol in borrar:
 
@@ -3595,7 +2897,6 @@ def limpiar_señales():
             ]
 
             hubo_cambios = True
-
 
     if hubo_cambios:
 
@@ -3620,13 +2921,7 @@ def ejecutar_bot():
         "===================================="
     )
 
-
     cargar_estado()
-
-
-    # --------------------------------------------------------
-    # MENSAJE AL INICIAR
-    # --------------------------------------------------------
 
     enviar_telegram(
 
@@ -3641,17 +2936,17 @@ def ejecutar_bot():
 
         "⏱️ 1D / 4H / 1H / 15M / 5M\n\n"
 
-        "🛑 Stop Loss técnico "
-        "con protección contra stops demasiado cercanos.\n\n"
+        "🛡️ Filtro sobrecompra:\n"
+        "RSI 1H > 75 = DESCARTAR\n"
+        "Stoch RSI 1H > 85 = DESCARTAR\n\n"
 
         "👤 Operaciones manuales."
-    )
 
+    )
 
     monedas = []
 
     ultima_seleccion = 0
-
 
     while True:
 
@@ -3659,22 +2954,19 @@ def ejecutar_bot():
 
             ahora = time.time()
 
-
-            # ------------------------------------------------
-            # ACTUALIZAR UNIVERSO CADA 6 HORAS
-            # ------------------------------------------------
+            # =================================================
+            # RECALCULAR MONEDAS CADA 6 HORAS
+            # =================================================
 
             if (
                 not monedas
-                or ahora
+                or
+                ahora
                 - ultima_seleccion
                 > 21600
             ):
 
-                nuevas = (
-                    seleccionar_monedas()
-                )
-
+                nuevas = seleccionar_monedas()
 
                 if nuevas:
 
@@ -3682,12 +2974,10 @@ def ejecutar_bot():
 
                     ultima_seleccion = ahora
 
-
                     print(
                         "Universo actualizado:",
                         len(monedas)
                     )
-
 
             if not monedas:
 
@@ -3695,11 +2985,9 @@ def ejecutar_bot():
                     "No hay monedas disponibles."
                 )
 
-
                 time.sleep(60)
 
                 continue
-
 
             print(
                 "--------------------------------"
@@ -3715,11 +3003,6 @@ def ejecutar_bot():
                 "--------------------------------"
             )
 
-
-            # ------------------------------------------------
-            # ANALIZAR MONEDAS
-            # ------------------------------------------------
-
             for symbol in monedas:
 
                 print(
@@ -3727,47 +3010,27 @@ def ejecutar_bot():
                     symbol
                 )
 
-
                 procesar_moneda(
                     symbol
                 )
-
 
                 time.sleep(
                     PAUSA_ENTRE_MONEDAS_CICLO
                 )
 
-
-            # ------------------------------------------------
-            # VIGILAR SEÑALES
-            # ------------------------------------------------
-
             vigilar_señales_activas()
-
-
-            # ------------------------------------------------
-            # LIMPIAR ANTIGUAS
-            # ------------------------------------------------
 
             limpiar_señales()
 
-
             print(
-                "Ciclo terminado."
-            )
-
-
-            print(
-                "Esperando",
+                "Ciclo terminado. Esperando",
                 INTERVALO_ANALISIS,
                 "segundos."
             )
 
-
             time.sleep(
                 INTERVALO_ANALISIS
             )
-
 
         except Exception as e:
 
@@ -3776,12 +3039,11 @@ def ejecutar_bot():
                 e
             )
 
-
             time.sleep(30)
 
 
 # ============================================================
-# RUTA PRINCIPAL
+# RUTAS WEB
 # ============================================================
 
 @app.route("/")
@@ -3792,17 +3054,15 @@ def inicio():
     )
 
 
-# ============================================================
-# TEST TELEGRAM
-# ============================================================
-
 @app.route("/test")
 def test():
 
     if (
         not ADMIN_TOKEN
-        or request.args.get("token")
-        != ADMIN_TOKEN
+        or
+        request.args.get(
+            "token"
+        ) != ADMIN_TOKEN
     ):
 
         return (
@@ -3810,38 +3070,33 @@ def test():
             403
         )
 
-
     enviar_telegram(
 
         "🟢 TEST TELEGRAM\n\n"
-
         "El bot está conectado correctamente."
-    )
 
+    )
 
     return (
         "TEST TELEGRAM ENVIADO"
     )
 
 
-# ============================================================
-# ESTADO
-# ============================================================
-
 @app.route("/estado")
 def estado():
 
     if (
         not ADMIN_TOKEN
-        or request.args.get("token")
-        != ADMIN_TOKEN
+        or
+        request.args.get(
+            "token"
+        ) != ADMIN_TOKEN
     ):
 
         return (
             "No autorizado",
             403
         )
-
 
     with _lock_errores:
 
@@ -3852,7 +3107,6 @@ def estado():
         ultimo_codigo = (
             _ultimo_codigo_error
         )
-
 
     return {
 
@@ -3866,6 +3120,7 @@ def estado():
             list(
                 señales_activas.keys()
             )
+
     }
 
 
@@ -3875,10 +3130,6 @@ def estado():
 
 if __name__ == "__main__":
 
-    # --------------------------------------------------------
-    # HILO PRINCIPAL DEL BOT
-    # --------------------------------------------------------
-
     hilo_bot = threading.Thread(
         target=ejecutar_bot,
         daemon=True
@@ -3886,22 +3137,12 @@ if __name__ == "__main__":
 
     hilo_bot.start()
 
-
-    # --------------------------------------------------------
-    # HILO DEL REPORTE DIARIO
-    # --------------------------------------------------------
-
     hilo_reporte = threading.Thread(
         target=reporte_diario_estado,
         daemon=True
     )
 
     hilo_reporte.start()
-
-
-    # --------------------------------------------------------
-    # SERVIDOR FLASK
-    # --------------------------------------------------------
 
     app.run(
         host="0.0.0.0",
