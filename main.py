@@ -68,6 +68,15 @@ MAX_LEVERAGE = 10
 
 MIN_GANANCIA_NETA = 1.50
 
+# Filtro liviano de momentum en 5M antes de mandar la orden: exige algo
+# de fuerza de tendencia y que el volumen no esté muerto, PERO sin pedir
+# que RSI/MACD/DI estén todos alineados como en la versión vieja (eso
+# hacía perder entradas buenas por ser demasiado exigente). La idea es
+# filtrar los casos más obvios de "se acerca a la zona pero sin nada
+# de fuerza real detrás", sin resignar demasiada anticipación.
+UMBRAL_ADX_MINIMO_5M = 18
+UMBRAL_VOLUMEN_MINIMO_5M = 0.90
+
 # Comisión TAKER por lado en Binance Futures (revisá tu tier real:
 # VIP0 = 0.05%, con BNB descuento = 0.04%). Se aplica x2 (entrada+salida)
 # y se escala con el apalancamiento porque el % se mide sobre margen.
@@ -1066,8 +1075,40 @@ def esta_cerca(precio, zona_min, zona_max, atr_value):
 
 
 # ============================================================
+# ¿HAY MOMENTUM MÍNIMO? (filtro liviano antes de mandar la orden)
+# ============================================================
+
+def hay_momentum_minimo(data):
+    """True si en 5M hay algo de fuerza de tendencia y el volumen no
+    está muerto. No exige alineación de RSI/MACD/DI (eso era lo que
+    hacía perder entradas buenas por demasiado exigente) — solo
+    descarta el caso más obvio: precio cerca de la zona pero sin
+    ninguna fuerza real empujando en ese momento."""
+
+    adx = data["5m"]["adx"]
+    volumen = data["5m"]["volumen_ratio"]
+
+    if adx < UMBRAL_ADX_MINIMO_5M:
+        return False
+
+    if volumen < UMBRAL_VOLUMEN_MINIMO_5M:
+        return False
+
+    return True
+
+
+# ============================================================
 # CONFIRMACION 5M
 # ============================================================
+
+# ============================================================
+# CONFIRMACION EXTRA EN 5M (YA NO SE USA)
+# ============================================================
+# Esta función quedó SIN USO desde que se unificó prealerta+confirmación
+# en un solo aviso (mandar_orden_compra). La dejamos definida por si en
+# algún momento querés agregar de nuevo un filtro extra de momentum en
+# 5M antes de mandar la orden — bastaría con volver a llamarla en
+# procesar_moneda antes de mandar_orden_compra.
 
 def confirmar_entrada(data, direccion, zona_min, zona_max):
 
@@ -1197,59 +1238,22 @@ def precio_texto(precio):
 
 
 # ============================================================
-# PREALERTA
+# ORDEN DE COMPRA/VENTA (antes: prealerta + confirmación separadas)
 # ============================================================
+# Se manda UN SOLO aviso, apenas el precio entra en la zona de interés
+# (con la anticipación que da PREALERTA_ATR), con el Stop y los TP ya
+# calculados. Ya no espera la confirmación extra de 5M (ADX/volumen/
+# RSI/MACD/DI) porque esa espera era justo lo que hacía que el aviso
+# llegara tarde o directamente no llegara. A cambio, vas a recibir
+# más avisos, y alguno puede no jugar tan bien como uno "confirmado"
+# habría jugado — es la contrapartida de tener anticipación real.
 
-def mandar_prealerta(symbol, data, direccion, score, motivos, zona):
+def mandar_orden_compra(symbol, data, direccion, score, motivos, zona):
+    """Manda la orden con SL/TP y devuelve (precio, stop, tp1, tp2)
+    si se mandó, o None si se descartó (ganancia neta insuficiente,
+    sin avisar por Telegram a propósito)."""
 
     zona_min, zona_max, nivel = zona
-    precio = data["5m"]["precio"]
-
-    distancia = abs(precio - nivel) / precio * 100
-
-    # ATR de 4H para dar más holgura al stop/TP mostrado en la prealerta
-    # (todavía no es una entrada confirmada, es orientativo).
-    atr_value = data["4h"]["atr"]
-
-    stop = tp1 = tp2 = None
-    if atr_value:
-        stop, tp1, tp2 = calcular_tp_sl(nivel, atr_value, direccion)
-
-    titulo = "🟡 PREALERTA LONG" if direccion == "LONG" else "🟠 PREALERTA SHORT"
-
-    niveles_texto = ""
-    if stop is not None:
-        niveles_texto = (
-            f"🛑 Stop Loss (orientativo): {precio_texto(stop)}\n"
-            f"🎯 Take Profit 1 (orientativo): {precio_texto(tp1)}\n"
-            f"🎯 Take Profit 2 (orientativo): {precio_texto(tp2)}\n\n"
-        )
-
-    mensaje = (
-        f"{titulo}\n{symbol}\n\n"
-        f"💰 Precio actual: {precio_texto(precio)}\n"
-        f"🎯 Zona: {precio_texto(zona_min)} — {precio_texto(zona_max)}\n"
-        f"📍 Nivel: {precio_texto(nivel)}\n"
-        f"📏 Distancia: {distancia:.2f}%\n\n"
-        f"{niveles_texto}"
-        f"⭐ Confluencia: {score}/10\n\n"
-        "📊 Motivos:\n"
-        + "\n".join("• " + m for m in motivos)
-        + "\n\n⚠️ PREPARÁ LA OPERACIÓN.\nTodavía NO entrar.\nEsperar confirmación."
-    )
-
-    enviar_telegram(mensaje)
-
-
-# ============================================================
-# CONFIRMACION
-# ============================================================
-
-def mandar_confirmacion(symbol, data, direccion, score, motivos):
-    """Manda la confirmación de entrada y devuelve (precio, stop, tp1, tp2)
-    si la señal se mandó, o None si se descartó (para que quien la llama
-    sepa si hay que registrar la operación para seguimiento de TP)."""
-
     precio = data["5m"]["precio"]
     atr_value = data["1h"]["atr"]
 
@@ -1275,11 +1279,12 @@ def mandar_confirmacion(symbol, data, direccion, score, motivos):
     funding_text = "N/D" if funding is None else f"{funding:.4f}%"
     oi_text = "N/D" if open_interest is None else f"{open_interest:,.2f}"
 
-    titulo = "🟢 LONG CONFIRMADO" if direccion == "LONG" else "🔴 SHORT CONFIRMADO"
+    titulo = "🟢 ORDEN DE COMPRA (LONG)" if direccion == "LONG" else "🔴 ORDEN DE VENTA (SHORT)"
 
     mensaje = (
         f"{titulo}\n{symbol}\n\n"
-        f"💰 ENTRADA: {precio_texto(precio)}\n\n"
+        f"💰 PRECIO ACTUAL: {precio_texto(precio)}\n"
+        f"🎯 ZONA DE ENTRADA: {precio_texto(zona_min)} — {precio_texto(zona_max)}\n\n"
         f"🎯 TP1: {precio_texto(tp1)}\n"
         f"🎯 TP2: {precio_texto(tp2)}\n"
         f"🛑 STOP: {precio_texto(stop)}\n\n"
@@ -1294,7 +1299,9 @@ def mandar_confirmacion(symbol, data, direccion, score, motivos):
         f"💰 Resultado bruto: +{bruto:.2f}%\n"
         f"💸 Comisión estimada (x{leverage}): -{COMISION_TAKER_POR_LADO * 2 * leverage:.2f}%\n"
         f"✅ Resultado neto: +{neto:.2f}%\n\n"
-        "👤 OPERACIÓN MANUAL\nEl bot NO compra ni vende.\n\n"
+        "👤 OPERACIÓN MANUAL — el bot NO compra ni vende.\n"
+        "⚠️ Llega CON ANTICIPACIÓN: el precio puede seguir moviéndose\n"
+        "antes de que operes. Ajustá según el precio real al ejecutar.\n\n"
         "📊 Motivos:\n"
         + "\n".join("• " + m for m in motivos)
     )
@@ -1334,60 +1341,45 @@ def procesar_moneda(symbol):
         if not atr_value:
             return
 
-        with señales_lock:
-            señal_actual = señales_activas.get(symbol)
-
         cerca = esta_cerca(precio, zona_min, zona_max, atr_value)
 
-        if cerca:
+        if not cerca:
+            return
 
-            debe_prealertar = (
-                not señal_actual
-                or señal_actual["direccion"] != direccion
-            )
-
-            if debe_prealertar:
-
-                mandar_prealerta(symbol, data, direccion, score, motivos, zona)
-
-                with señales_lock:
-                    señales_activas[symbol] = {
-                        "direccion": direccion,
-                        "prealerta": True,
-                        "confirmada": False,
-                        "timestamp": time.time()
-                    }
-
-                guardar_estado()
-                return
-
-        if not confirmar_entrada(data, direccion, zona_min, zona_max):
+        if not hay_momentum_minimo(data):
+            # El precio está cerca de la zona pero todavía sin fuerza
+            # real detrás (ADX o volumen flojos en 5M). No mandamos
+            # nada todavía — se vuelve a chequear en el próximo ciclo,
+            # y si el precio se aleja de la zona, esta_cerca() lo va
+            # a filtrar solo más adelante.
             return
 
         with señales_lock:
             señal_actual = señales_activas.get(symbol)
 
-            if (
-                señal_actual
-                and señal_actual.get("confirmada")
-                and señal_actual.get("direccion") == direccion
-            ):
-                return
+        # Evita mandar la misma orden de nuevo mientras siga vigente
+        # en la misma dirección. Si cambia de LONG a SHORT (o viceversa),
+        # se considera una oportunidad nueva y sí se vuelve a avisar.
+        debe_enviar = (
+            not señal_actual
+            or señal_actual.get("direccion") != direccion
+        )
 
-        resultado_confirmacion = mandar_confirmacion(symbol, data, direccion, score, motivos)
-
-        if not resultado_confirmacion:
-            # Se descartó adentro de mandar_confirmacion (ej. ganancia
-            # neta insuficiente). No hay operación real que seguir.
+        if not debe_enviar:
             return
 
-        precio_entrada, stop, tp1, tp2 = resultado_confirmacion
+        resultado = mandar_orden_compra(symbol, data, direccion, score, motivos, zona)
+
+        if not resultado:
+            # Descartada por ganancia neta insuficiente. No se avisa
+            # por Telegram a propósito (así lo pediste).
+            return
+
+        precio_entrada, stop, tp1, tp2 = resultado
 
         with señales_lock:
             señales_activas[symbol] = {
                 "direccion": direccion,
-                "prealerta": True,
-                "confirmada": True,
                 "timestamp": time.time(),
                 # Campos para el seguimiento de TP1/TP2 (vigilar_señales_activas)
                 "precio_entrada": precio_entrada,
@@ -1406,9 +1398,9 @@ def procesar_moneda(symbol):
 # ============================================================
 # SEGUIMIENTO DE TP1 / TP2 EN SEÑALES CONFIRMADAS
 # ============================================================
-# Recorre las señales CONFIRMADAS (las que tienen "estado", es decir,
-# las que vinieron de mandar_confirmacion, no las simples prealertas)
-# y avisa por Telegram cuando el precio va tocando TP1 o TP2.
+# Recorre las señales activas (todas tienen "estado" ahora, ya que
+# se generan directamente en mandar_orden_compra) y avisa por
+# Telegram cuando el precio va tocando TP1 o TP2.
 
 def vigilar_señales_activas():
 
@@ -1548,7 +1540,7 @@ def ejecutar_bot():
         "🤖 BOT FUTUROS ONLINE\n\n"
         "Sistema de análisis activado.\n\n"
         "📊 50 monedas dinámicas\n"
-        "🟢 LONG\n🔴 SHORT\n🟡 PREALERTA\n\n"
+        "🟢 LONG\n🔴 SHORT\n\n"
         "⏱️ 1D / 4H / 1H / 15M / 5M\n\n"
         "👤 Operaciones manuales."
     )
