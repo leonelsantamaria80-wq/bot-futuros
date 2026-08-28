@@ -68,6 +68,51 @@ MIN_GANANCIA_NETA = 1.50
 
 
 # ============================================================
+# GESTION DE EXPOSICION
+# ============================================================
+#
+# Cuántas señales pueden estar "abiertas" (esperando_tp1 o
+# esperando_tp2) al mismo tiempo. Si ya se llegó al máximo,
+# no se generan señales nuevas hasta que se cierre alguna.
+#
+# Esto no reemplaza el manejo de tamaño de posición que hacés
+# vos manualmente, pero evita que el bot te tire 15 señales
+# simultáneas sin ningún techo.
+#
+# ============================================================
+
+MAX_SEÑALES_SIMULTANEAS = 5
+
+
+# ============================================================
+# LIMITE DE RIESGO POR STOP
+# ============================================================
+#
+# Si la distancia entre precio de entrada y stop loss supera
+# este % del precio, la señal se descarta: un stop demasiado
+# lejos implica una pérdida potencial grande por operación,
+# más allá del apalancamiento sugerido.
+#
+# ============================================================
+
+MAX_STOP_PCT = 3.0
+
+
+# ============================================================
+# LIQUIDEZ MINIMA PARA MONEDAS VOLATILES
+# ============================================================
+#
+# Las 10 monedas de "alta volatilidad" son las más riesgosas
+# del universo. Además del piso general de volumen (20M), se
+# les exige un piso más alto para evitar operar cosas con poca
+# profundidad de mercado.
+#
+# ============================================================
+
+LIQUIDEZ_MINIMA_VOLATILES = 40_000_000
+
+
+# ============================================================
 # FILTRO DE SOBRECOMPRA
 # ============================================================
 #
@@ -1555,9 +1600,31 @@ def seleccionar_monedas():
         :MONEDAS_BAJA_VOLATILIDAD
     ]
 
-    volatiles = candidatos[
-        -MONEDAS_ALTA_VOLATILIDAD:
+    # --- FILTRO DE LIQUIDEZ PARA VOLATILES ---
+    # Antes de tomar las más volátiles, exigimos un volumen
+    # más alto que el piso general (20M) para no meter
+    # monedas de poca profundidad justo en el bucket riesgoso.
+
+    candidatos_liquidos = [
+        c
+        for c in candidatos
+        if c["volumen"] >= LIQUIDEZ_MINIMA_VOLATILES
     ]
+
+    if candidatos_liquidos:
+
+        volatiles = candidatos_liquidos[
+            -MONEDAS_ALTA_VOLATILIDAD:
+        ]
+
+    else:
+
+        # Si ninguna cumple el piso más alto, evitamos dejar
+        # el bucket vacío y usamos el criterio general.
+
+        volatiles = candidatos[
+            -MONEDAS_ALTA_VOLATILIDAD:
+        ]
 
     seleccionadas = (
         tranquilas
@@ -2216,19 +2283,25 @@ def mandar_orden_compra(
 
     precio = data["5m"]["precio"]
 
-        atr_value = data["1h"]["atr"]
+    atr_value = data["1h"]["atr"]
+
     if not atr_value:
         return None
+
     # --- NUEVO FILTRO RSI ---
+
     rsi = data["5m"]["rsi"]
+
     # Evitar comprar caro en operaciones alcistas
     if direccion == "LONG" and rsi > 75:
         return None
+
     # Evitar vender barato en operaciones bajistas
     if direccion == "SHORT" and rsi < 25:
         return None
+
     # --- FIN FILTRO ---
-  
+
     # ========================================================
     # MINIMO DE LAS ULTIMAS 20 VELAS
     # ========================================================
@@ -2268,6 +2341,29 @@ def mandar_orden_compra(
         low_20_velas=low_20_velas
 
     )
+
+    # --- LIMITE DE RIESGO POR STOP ---
+    # Si el stop quedó demasiado lejos del precio de entrada,
+    # descartamos la señal: no importa el apalancamiento, la
+    # pérdida potencial por operación ya es excesiva.
+
+    stop_pct = (
+        abs(precio - stop)
+        / precio
+        * 100
+    )
+
+    if stop_pct > MAX_STOP_PCT:
+
+        print(
+            symbol,
+            "descartado: stop demasiado lejos",
+            f"({stop_pct:.2f}%)"
+        )
+
+        return None
+
+    # --- FIN LIMITE DE RIESGO ---
 
     adx = data["1h"]["adx"]
 
@@ -2406,7 +2502,8 @@ def mandar_orden_compra(
         f"{precio_texto(tp2)}\n"
 
         f"🛑 STOP: "
-        f"{precio_texto(stop)}\n\n"
+        f"{precio_texto(stop)} "
+        f"(riesgo {stop_pct:.2f}% del precio)\n\n"
 
         f"📉 MÍNIMO 20 VELAS 4H: "
         f"{precio_texto(low_20_velas)}\n\n"
@@ -2604,6 +2701,29 @@ def procesar_moneda(symbol):
         )
 
         if not debe_enviar:
+            return
+
+        # ====================================================
+        # LIMITE DE EXPOSICION SIMULTANEA
+        # ====================================================
+
+        with señales_lock:
+
+            cantidad_activas = len(
+                señales_activas
+            )
+
+        if cantidad_activas >= MAX_SEÑALES_SIMULTANEAS:
+
+            print(
+                symbol,
+                "descartado: ya hay",
+                cantidad_activas,
+                "señales activas (máximo",
+                MAX_SEÑALES_SIMULTANEAS,
+                ")"
+            )
+
             return
 
         # ====================================================
