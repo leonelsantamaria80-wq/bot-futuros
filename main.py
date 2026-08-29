@@ -16,10 +16,19 @@ from flask import Flask, jsonify, request
 import websocket
 
 # ============================================================
-# BOT DE FUTUROS PRO - SEÑALES MANUALES
+# BOT DE FUTUROS PRO - SEÑALES MANUALES (v3)
 # ============================================================
 # Binance USDⓈ-M Futures -> análisis + precio en vivo -> Telegram.
 # NO coloca órdenes en Binance.
+#
+# Novedades v3:
+#   - Alerta por Telegram si Binance empieza a fallar en serio
+#     (errores consecutivos) o si devuelve 451 (bloqueo regional/IP).
+#   - Límite de exposición TOTAL (pendientes + trades virtuales),
+#     no solo de señales pendientes.
+#   - Confirmación / cancelación de señales con BOTONES en el
+#     mensaje de Telegram (webhook), además de los endpoints
+#     manuales /confirmar y /cancelar que ya existían.
 #
 # Diseño principal:
 #   1) REST: velas cerradas, universo, funding, OI, filtros.
@@ -38,6 +47,7 @@ BINANCE_URL = os.getenv("BINANCE_URL", "https://fapi.binance.com")
 WS_URL = os.getenv("BINANCE_WS_URL", "wss://fstream.binance.com/market/stream")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")  # opcional pero recomendado
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +59,11 @@ MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "20000000"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "8"))
 MIN_SCORE_GRADE_A = int(os.getenv("MIN_SCORE_GRADE_A", "9"))
 MAX_SIGNAL_SLOTS = int(os.getenv("MAX_SIGNAL_SLOTS", "5"))
+
+# Exposición total = señales pendientes + trades virtuales en seguimiento.
+# Antes solo se limitaban las pendientes; esto evita acumular más
+# posiciones virtuales de las que realmente podés seguir.
+MAX_TOTAL_EXPOSURE = int(os.getenv("MAX_TOTAL_EXPOSURE", "8"))
 
 # La señal final se mantiene válida durante este tiempo.
 SIGNAL_TTL_SECONDS = int(os.getenv("SIGNAL_TTL_SECONDS", "240"))  # 4 min
@@ -84,6 +99,11 @@ VOLUME_MIN_5M = 0.90
 FUNDING_INFRA_PCT = -0.02
 FUNDING_SOBRE_PCT = 0.08
 
+# Alertas de salud de Binance (para no perder señales en silencio).
+ALERT_ERROR_THRESHOLD = int(os.getenv("ALERT_ERROR_THRESHOLD", "20"))
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "900"))  # 15 min entre alertas repetidas
+BLOCKED_ALERT_COOLDOWN_SECONDS = int(os.getenv("BLOCKED_ALERT_COOLDOWN_SECONDS", "60"))
+
 # ------------------------- APP / LOG -------------------------
 app = Flask(__name__)
 
@@ -102,7 +122,7 @@ if not logger.handlers:
         pass
 
 session = requests.Session()
-session.headers.update({"User-Agent": "futures-signal-bot-pro/2.0"})
+session.headers.update({"User-Agent": "futures-signal-bot-pro/3.0"})
 
 # ------------------------- ESTADO ----------------------------
 state_lock = threading.RLock()
@@ -131,6 +151,7 @@ error_lock = threading.Lock()
 consecutive_binance_errors = 0
 last_binance_error = None
 last_error_alert = 0.0
+last_blocked_alert = 0.0
 
 
 def utc_iso(ts=None):
@@ -168,13 +189,16 @@ def load_state():
 
 
 # ------------------------- TELEGRAM --------------------------
-def send_telegram(text):
+def send_telegram(text, reply_markup=None):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram no configurado.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
-        r = session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=12)
+        r = session.post(url, json=payload, timeout=12)
         if r.status_code != 200:
             logger.error("Telegram %s: %s", r.status_code, r.text[:300])
             return False
@@ -182,6 +206,68 @@ def send_telegram(text):
     except Exception as exc:
         logger.error("Telegram error: %s", exc)
         return False
+
+
+def answer_callback(callback_query_id, text, show_alert=False):
+    if not TELEGRAM_TOKEN or not callback_query_id:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
+    try:
+        r = session.post(url, json={
+            "callback_query_id": callback_query_id,
+            "text": text[:200],
+            "show_alert": show_alert,
+        }, timeout=8)
+        return r.status_code == 200
+    except Exception as exc:
+        logger.warning("answerCallbackQuery error: %s", exc)
+        return False
+
+
+def confirm_keyboard(symbol):
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ Confirmar (precio actual)", "callback_data": f"confirm:{symbol}"},
+            {"text": "❌ Cancelar", "callback_data": f"cancel:{symbol}"},
+        ]]
+    }
+
+
+# ------------------------- ALERTAS DE SALUD -------------------
+def maybe_alert_binance_down(blocked=False, status_code=None):
+    """Avisa por Telegram si Binance empieza a fallar de forma sostenida,
+    o inmediatamente si detecta un bloqueo regional (451/403 tipo geo-block)."""
+    global last_error_alert, last_blocked_alert
+    now = time.time()
+    with error_lock:
+        errors = consecutive_binance_errors
+        last_err = last_binance_error
+
+    if blocked:
+        with error_lock:
+            if now - last_blocked_alert < BLOCKED_ALERT_COOLDOWN_SECONDS:
+                return
+            last_blocked_alert = now
+        send_telegram(
+            "🚫 ALERTA BOT FUTUROS PRO\n\n"
+            f"Binance devolvió {status_code} (bloqueo por región/IP del servidor).\n"
+            "Reintentar no sirve: esto no se arregla solo. Hay que revisar "
+            "el hosting/proxy o el endpoint de Binance usado.\n"
+            "Mientras tanto el bot puede quedarse SIN analizar monedas."
+        )
+        return
+
+    if errors < ALERT_ERROR_THRESHOLD:
+        return
+    with error_lock:
+        if now - last_error_alert < ALERT_COOLDOWN_SECONDS:
+            return
+        last_error_alert = now
+    send_telegram(
+        "⚠️ ALERTA BOT FUTUROS PRO\n\n"
+        f"Binance viene fallando: {errors} errores seguidos (último código: {last_err}).\n"
+        "Es posible que el bot esté sin poder analizar el mercado. Revisar logs/Render."
+    )
 
 
 # ------------------------- BINANCE REST ----------------------
@@ -195,6 +281,16 @@ def binance_get(endpoint, params=None, retries=3):
                     consecutive_binance_errors = 0
                     last_binance_error = None
                 return r.json()
+
+            if r.status_code == 451:
+                # Bloqueo geográfico/IP: reintentar es inútil, avisar ya.
+                with error_lock:
+                    consecutive_binance_errors += 1
+                    last_binance_error = 451
+                logger.error("Binance 451 (bloqueo regional) en %s", endpoint)
+                maybe_alert_binance_down(blocked=True, status_code=451)
+                return None
+
             if r.status_code in (418, 429):
                 retry_after = r.headers.get("Retry-After")
                 try:
@@ -204,10 +300,12 @@ def binance_get(endpoint, params=None, retries=3):
                 logger.warning("Rate limit Binance %s; esperando %ss", r.status_code, wait)
                 time.sleep(wait)
                 continue
+
             with error_lock:
                 consecutive_binance_errors += 1
                 last_binance_error = r.status_code
             logger.error("Binance REST %s %s: %s", r.status_code, endpoint, r.text[:250])
+            maybe_alert_binance_down()
             return None
         except Exception as exc:
             logger.warning("Binance REST intento %d/%d: %s", attempt + 1, retries, exc)
@@ -215,6 +313,7 @@ def binance_get(endpoint, params=None, retries=3):
     with error_lock:
         consecutive_binance_errors += 1
         last_binance_error = "NETWORK"
+    maybe_alert_binance_down()
     return None
 
 
@@ -862,9 +961,10 @@ def send_final_signal(plan, price):
         f"{plan['emoji']} Funding: {funding} ({plan['valuation']})\n\n"
         f"⏱️ SEÑAL VÁLIDA {valid//60}m {valid%60:02d}s\n"
         f"⚠️ Si el precio sale de la zona o vence el tiempo: NO ENTRAR.\n"
-        f"👤 Orden MANUAL. El bot NO compra."
+        f"👤 Orden MANUAL. El bot NO compra.\n\n"
+        f"Tocá 'Confirmar' recién DESPUÉS de haber cargado la orden en Binance:"
     )
-    return send_telegram(msg)
+    return send_telegram(msg, reply_markup=confirm_keyboard(s))
 
 
 def send_expired(plan, reason="Tiempo agotado"):
@@ -896,14 +996,52 @@ def send_virtual_exit(trade, price, reason):
     )
 
 
+# ------------------------- CONFIRMAR / CANCELAR ---------------
+# Lógica compartida entre el endpoint manual (/confirmar, /cancelar)
+# y los botones de Telegram (webhook), para no duplicar código.
+def do_confirm(symbol, price):
+    symbol = symbol.upper()
+    with state_lock:
+        plan = state["pending"].pop(symbol, None)
+        if not plan:
+            return False, "No hay señal pendiente para ese símbolo"
+        plan["entered"] = True
+        plan["entry_price_real"] = price
+        plan["status"] = "TP1_WAIT"
+        plan["confirmed_at"] = time.time()
+        state["virtual_trades"][symbol] = plan
+    save_state()
+    send_telegram(
+        f"🟢 ENTRADA CONFIRMADA {symbol}\n"
+        f"Precio: {fmt_price(symbol, price)}\n"
+        f"El bot inicia seguimiento virtual de SL/TP."
+    )
+    return True, f"Entrada confirmada a {fmt_price(symbol, price)}"
+
+
+def do_cancel(symbol):
+    symbol = symbol.upper()
+    with state_lock:
+        plan = state["pending"].pop(symbol, None)
+    if not plan:
+        return False, "No hay señal pendiente para ese símbolo"
+    save_state()
+    send_telegram(f"⚪ SEÑAL CANCELADA MANUALMENTE {symbol}")
+    return True, "Señal cancelada"
+
+
 # ------------------------- PROCESS ---------------------------
 def process_symbol(symbol):
     try:
-        # No gastar llamadas REST si ya hay una señal/trade de este símbolo.
+        # No gastar llamadas REST si ya hay una señal/trade de este símbolo,
+        # ni si ya estamos en el tope de señales pendientes o de exposición total.
         with state_lock:
             if symbol in state["pending"] or symbol in state["virtual_trades"]:
                 return
             if len(state["pending"]) >= MAX_SIGNAL_SLOTS:
+                return
+            total_exposure = len(state["pending"]) + len(state["virtual_trades"])
+            if total_exposure >= MAX_TOTAL_EXPOSURE:
                 return
 
         d = build_analysis(symbol)
@@ -960,7 +1098,13 @@ def process_symbol(symbol):
                     send_prealert(plan, price)
             return
 
-        # Confirmación final: precio ya está en zona.
+        # Confirmación final: precio ya está en zona. Revalidar exposición
+        # total por si cambió mientras se armaba el análisis.
+        with state_lock:
+            total_exposure = len(state["pending"]) + len(state["virtual_trades"])
+            if total_exposure >= MAX_TOTAL_EXPOSURE:
+                return
+
         plan["status"] = "PENDING"
         plan["created_at"] = time.time()
         plan["expires_at"] = plan["created_at"] + SIGNAL_TTL_SECONDS
@@ -1102,12 +1246,16 @@ def daily_report_loop():
                 live_count = sum(1 for x in live_market.values() if time.time() - x.get("last_event", 0) < 10)
             with state_lock:
                 ws_ok = state["ws_connected"]
+            with error_lock:
+                errors = consecutive_binance_errors
+                last_err = last_binance_error
             send_telegram(
                 "✅ BOT FUTUROS PRO — CONTROL DIARIO\n\n"
                 f"WS mercado: {'🟢' if ws_ok else '🔴'}\n"
                 f"Precios vivos recientes: {live_count}\n"
                 f"Señales pendientes: {pending}\n"
-                f"Trades virtuales: {trades}\n"
+                f"Trades virtuales: {trades} (exposición máx: {MAX_TOTAL_EXPOSURE})\n"
+                f"Errores Binance consecutivos: {errors} (último: {last_err})\n"
                 "👤 Operación manual: el bot no ejecuta órdenes."
             )
             last_day = key
@@ -1129,12 +1277,20 @@ def health():
     with state_lock:
         ws_ok = bool(state["ws_connected"])
         last_analysis = state["last_analysis"]
+        exposure = len(state["pending"]) + len(state["virtual_trades"])
+    with error_lock:
+        errors = consecutive_binance_errors
+        last_err = last_binance_error
     return jsonify({
         "status": "ok",
         "ws_connected": ws_ok,
         "universe_size": len(universe),
         "last_analysis": utc_iso(last_analysis) if last_analysis else None,
         "uptime_seconds": int(time.time() - state.get("started_at", time.time())),
+        "total_exposure": exposure,
+        "max_total_exposure": MAX_TOTAL_EXPOSURE,
+        "consecutive_binance_errors": errors,
+        "last_binance_error": last_err,
     })
 
 
@@ -1181,6 +1337,8 @@ def signal_detail(symbol):
 # El bot no puede saber si realmente compraste en Binance sin API privada.
 # Para que el seguimiento virtual use tu precio real, se puede llamar:
 # /confirmar?token=...&symbol=BTCUSDT&price=12345
+# (o, más cómodo, tocar el botón "Confirmar" en el mensaje de Telegram,
+# que usa el precio en vivo en el momento del click).
 @app.route("/confirmar")
 def confirm():
     if not authorized():
@@ -1190,18 +1348,8 @@ def confirm():
         price = float(request.args.get("price", ""))
     except ValueError:
         return "Precio inválido", 400
-    with state_lock:
-        plan = state["pending"].pop(symbol, None)
-        if not plan:
-            return "No hay señal pendiente para ese símbolo", 404
-        plan["entered"] = True
-        plan["entry_price_real"] = price
-        plan["status"] = "TP1_WAIT"
-        plan["confirmed_at"] = time.time()
-        state["virtual_trades"][symbol] = plan
-    save_state()
-    send_telegram(f"🟢 ENTRADA CONFIRMADA {symbol}\nPrecio manual: {fmt_price(symbol, price)}\nEl bot inicia seguimiento virtual de SL/TP.")
-    return "Entrada confirmada"
+    ok, msg = do_confirm(symbol, price)
+    return msg, (200 if ok else 404)
 
 
 @app.route("/cancelar")
@@ -1209,13 +1357,69 @@ def cancel_signal():
     if not authorized():
         return "No autorizado", 403
     symbol = request.args.get("symbol", "").upper()
-    with state_lock:
-        plan = state["pending"].pop(symbol, None)
-    if not plan:
-        return "No hay señal pendiente", 404
-    save_state()
-    send_telegram(f"⚪ SEÑAL CANCELADA MANUALMENTE {symbol}")
-    return "Cancelada"
+    ok, msg = do_cancel(symbol)
+    return msg, (200 if ok else 404)
+
+
+# ------------------------- TELEGRAM WEBHOOK -------------------
+# Recibe los clicks de los botones "Confirmar" / "Cancelar" que van
+# pegados al mensaje de señal. Para activarlo, una sola vez:
+#   GET /setup-webhook?token=TU_ADMIN_TOKEN
+# (usa automáticamente la URL pública de Render).
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    if TELEGRAM_WEBHOOK_SECRET:
+        header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if header != TELEGRAM_WEBHOOK_SECRET:
+            return "No autorizado", 403
+
+    update = request.get_json(silent=True) or {}
+    cq = update.get("callback_query")
+    if not cq:
+        return jsonify({"ok": True})
+
+    cq_id = cq.get("id")
+    data = cq.get("data", "")
+    try:
+        action, symbol = data.split(":", 1)
+    except ValueError:
+        answer_callback(cq_id, "Dato inválido")
+        return jsonify({"ok": True})
+
+    symbol = symbol.upper()
+
+    if action == "confirm":
+        price = live_price(symbol)
+        if price is None:
+            answer_callback(cq_id, "Sin precio en vivo ahora, usá /confirmar con precio manual", show_alert=True)
+            return jsonify({"ok": True})
+        ok, msg = do_confirm(symbol, price)
+        answer_callback(cq_id, msg, show_alert=not ok)
+    elif action == "cancel":
+        ok, msg = do_cancel(symbol)
+        answer_callback(cq_id, msg, show_alert=not ok)
+    else:
+        answer_callback(cq_id, "Acción desconocida")
+
+    return jsonify({"ok": True})
+
+
+@app.route("/setup-webhook")
+def setup_webhook():
+    if not authorized():
+        return "No autorizado", 403
+    if not TELEGRAM_TOKEN:
+        return "Falta TELEGRAM_TOKEN", 400
+    base_url = request.args.get("url") or request.url_root.rstrip("/")
+    webhook_url = base_url.rstrip("/") + "/telegram-webhook"
+    payload = {"url": webhook_url, "allowed_updates": ["callback_query"]}
+    if TELEGRAM_WEBHOOK_SECRET:
+        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+    try:
+        r = session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook", json=payload, timeout=12)
+        return jsonify(r.json())
+    except Exception as exc:
+        return f"Error: {exc}", 500
 
 
 # ------------------------- START / STOP ----------------------
@@ -1223,12 +1427,15 @@ def start_workers():
     global ws_thread, analysis_thread, monitor_thread
     load_state()
     send_telegram(
-        "🤖 BOT FUTUROS PRO ONLINE\n\n"
+        "🤖 BOT FUTUROS PRO ONLINE (v3)\n\n"
         "📡 Precio en vivo: WebSocket Binance\n"
         "📊 Análisis: 1D / 4H / 1H / 15M / 5M\n"
         "🧠 Señales confirmadas con velas CERRADAS\n"
         f"⏱️ Caducidad señal final: {SIGNAL_TTL_SECONDS//60} min\n"
         f"🎯 RR mínimo TP1: {MIN_RR_TP1:.1f} | TP2: {MIN_RR_TP2:.1f}\n"
+        f"📦 Exposición máxima simultánea: {MAX_TOTAL_EXPOSURE}\n"
+        "🔔 Ahora avisa si Binance falla o bloquea la IP.\n"
+        "✅ Confirmar/cancelar con botones en el mensaje de Telegram.\n"
         "👤 Órdenes manuales — el bot NO compra."
     )
 
