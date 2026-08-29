@@ -1,1644 +1,1259 @@
 import os
-import time
 import json
+import time
+import math
+import signal as os_signal
 import threading
-import datetime
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
+from urllib.parse import urlencode
+
 import numpy as np
 import requests
-from flask import Flask, request
+from flask import Flask, jsonify, request
+import websocket
 
 # ============================================================
-# BOT FUTUROS CRYPTO - SEÑALES TELEGRAM
+# BOT DE FUTUROS PRO - SEÑALES MANUALES
 # ============================================================
+# Binance USDⓈ-M Futures -> análisis + precio en vivo -> Telegram.
+# NO coloca órdenes en Binance.
 #
-# IMPORTANTE:
-# Este bot NO ejecuta operaciones.
-# Solamente analiza el mercado y manda señales a Telegram.
+# Diseño principal:
+#   1) REST: velas cerradas, universo, funding, OI, filtros.
+#   2) WebSocket: precio BID/ASK y MARK PRICE en vivo.
+#   3) Motor de señales: 1D/4H/1H/15M/5M, sin usar la vela abierta.
+#   4) Señal PENDIENTE con zona de entrada y caducidad.
+#   5) Vigilancia en vivo para entrada, cancelación, SL y TP.
+#   6) Persistencia atómica del estado.
 #
-# Mercado:
-# Binance USDⓈ-M Futures
-#
-# Temporalidades:
-# 1D / 4H / 1H / 15M / 5M
-#
-# ============================================================
-
-
-# ============================================================
-# CONFIGURACION
+# IMPORTANTE: esto no garantiza ganancias. Es un sistema de señales.
+# Probar primero en paper/demo y revisar cada señal manualmente.
 # ============================================================
 
+# ------------------------- CONFIG ----------------------------
+BINANCE_URL = os.getenv("BINANCE_URL", "https://fapi.binance.com")
+WS_URL = os.getenv("BINANCE_WS_URL", "wss://fstream.binance.com/market/stream")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
-BINANCE_URL = "https://fapi.binance.com"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(BASE_DIR, "estado_bot.json")
+LOG_FILE = os.path.join(BASE_DIR, "bot.log")
 
-ARCHIVO_ESTADO = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "estado_señales.json"
-)
+TOTAL_MONEDAS = int(os.getenv("TOTAL_MONEDAS", "50"))
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "20000000"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "8"))
+MIN_SCORE_GRADE_A = int(os.getenv("MIN_SCORE_GRADE_A", "9"))
+MAX_SIGNAL_SLOTS = int(os.getenv("MAX_SIGNAL_SLOTS", "5"))
 
+# La señal final se mantiene válida durante este tiempo.
+SIGNAL_TTL_SECONDS = int(os.getenv("SIGNAL_TTL_SECONDS", "240"))  # 4 min
+PREALERT_TTL_SECONDS = int(os.getenv("PREALERT_TTL_SECONDS", "900"))
+
+# Motor de análisis normal.
+ANALYSIS_INTERVAL = int(os.getenv("ANALYSIS_INTERVAL", "180"))
+UNIVERSE_REFRESH_SECONDS = int(os.getenv("UNIVERSE_REFRESH_SECONDS", "21600"))
+
+# Entrada: el precio debe estar dentro de la zona.
+ENTRY_ATR_WIDTH = float(os.getenv("ENTRY_ATR_WIDTH", "0.22"))
+PREALERT_ATR = float(os.getenv("PREALERT_ATR", "1.00"))
+ENTRY_MAX_CHASE_ATR = float(os.getenv("ENTRY_MAX_CHASE_ATR", "0.35"))
+
+# Riesgo.
+MAX_STOP_PCT = float(os.getenv("MAX_STOP_PCT", "2.50"))
+MIN_RR_TP1 = float(os.getenv("MIN_RR_TP1", "1.50"))
+MIN_RR_TP2 = float(os.getenv("MIN_RR_TP2", "2.00"))
+MIN_NET_TP2 = float(os.getenv("MIN_NET_TP2", "1.50"))
+MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", "5"))
+MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "10"))
+
+# Comisión aproximada por lado (% del notional). Ajustar a la cuenta real.
+TAKER_FEE_PCT_PER_SIDE = float(os.getenv("TAKER_FEE_PCT_PER_SIDE", "0.04"))
+
+# Filtros de mercado.
+RSI_OVERBOUGHT = 75.0
+RSI_OVERSOLD = 25.0
+ADX_MIN_5M = 18.0
+VOLUME_MIN_5M = 0.90
+
+# Funding expresado en porcentaje.
+FUNDING_INFRA_PCT = -0.02
+FUNDING_SOBRE_PCT = 0.08
+
+# ------------------------- APP / LOG -------------------------
 app = Flask(__name__)
 
+logger = logging.getLogger("futures_bot")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    stream = logging.StreamHandler()
+    stream.setFormatter(formatter)
+    logger.addHandler(stream)
+    try:
+        file_handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except Exception:
+        pass
+
 session = requests.Session()
-session.headers.update({
-    "User-Agent": "bot-senales-futuros/1.0"
-})
-
-
-# ============================================================
-# PARAMETROS DEL BOT
-# ============================================================
-
-TOTAL_MONEDAS = 50
-
-MONEDAS_BAJA_VOLATILIDAD = 40
-MONEDAS_ALTA_VOLATILIDAD = 10
-
-INTERVALO_ANALISIS = 180
-
-MIN_SCORE = 7
-
-MIN_LEVERAGE = 5
-MAX_LEVERAGE = 10
-
-MIN_GANANCIA_NETA = 1.50
-
-
-# ============================================================
-# GESTION DE EXPOSICION
-# ============================================================
-
-MAX_SEÑALES_SIMULTANEAS = 5
-
-
-# ============================================================
-# LIMITE DE RIESGO POR STOP
-# ============================================================
-
-MAX_STOP_PCT = 3.0
-
-
-# ============================================================
-# LIQUIDEZ MINIMA PARA MONEDAS VOLATILES
-# ============================================================
-
-LIQUIDEZ_MINIMA_VOLATILES = 40_000_000
-
-
-# ============================================================
-# FILTRO DE SOBRECOMPRA
-# ============================================================
-
-RSI_MAXIMO_COMPRA = 75
-STOCH_RSI_MAXIMO_COMPRA = 85
-
-
-# ============================================================
-# MOMENTUM 5M
-# ============================================================
-
-UMBRAL_ADX_MINIMO_5M = 18
-UMBRAL_VOLUMEN_MINIMO_5M = 0.90
-
-
-# ============================================================
-# COMISION
-# ============================================================
-
-COMISION_TAKER_POR_LADO = 0.04
-
-
-# ============================================================
-# PREALERTA
-# ============================================================
-
-PREALERTA_ATR = 1.50
-
-
-# ============================================================
-# VALORACION POR FUNDING RATE
-# ============================================================
-#
-# En futuros no hay balances/PER como en acciones, así que la
-# "valoración" se mide con el funding rate:
-#
-# Funding muy negativo -> mayoría en SHORT -> mercado con miedo
-#                          -> INFRAVALORADA (contrarian: bueno para LONG)
-# Funding muy positivo -> mayoría en LONG -> FOMO
-#                          -> SOBREVALORADA (contrarian: bueno para SHORT)
-#
-# Cuando la dirección de la señal coincide con la lectura del
-# funding (LONG+infravalorada, o SHORT+sobrevalorada), hay más
-# convicción -> dejamos correr la posición (50% en TP1, 50% en TP2).
-# Si no coincide, tomamos ganancia rápida y completa en TP1.
-# ============================================================
-
-UMBRAL_FUNDING_INFRA = -0.02
-UMBRAL_FUNDING_SOBRE = 0.08
-
-
-def clasificar_valoracion(funding):
-
-    if funding is None:
-        return "NEUTRAL", "⚪"
-
-    if funding < UMBRAL_FUNDING_INFRA:
-        return "INFRAVALORADA", "🟢"
-
-    if funding > UMBRAL_FUNDING_SOBRE:
-        return "SOBREVALORADA", "🔴"
-
-    return "NEUTRAL", "⚪"
-
-
-def debe_dejar_correr(direccion, valoracion):
-    # True = alineado con el funding -> repartir 50/50 en TP1/TP2
-    # False = no alineado -> tomar ganancia completa en TP1
-
-    if direccion == "LONG" and valoracion == "INFRAVALORADA":
-        return True
-
-    if direccion == "SHORT" and valoracion == "SOBREVALORADA":
-        return True
-
-    return False
-
-
-# ============================================================
-# RATE LIMIT / BACKOFF
-# ============================================================
-
-PAUSA_ENTRE_VELAS = 0.12
-PAUSA_ENTRE_SELECCION = 0.15
-PAUSA_ENTRE_MONEDAS_CICLO = 0.25
-
-ESPERA_MINIMA_RATE_LIMIT = 60
-
-
-# ============================================================
-# ALERTA DE FALLAS PERSISTENTES
-# ============================================================
-
-UMBRAL_ERRORES_ALERTA = 5
-COOLDOWN_ALERTA_SEGUNDOS = 3600
-
-_errores_consecutivos = 0
-_ultimo_codigo_error = None
-_ultima_alerta_error = 0
-
-_lock_errores = threading.Lock()
-
-
-def _registrar_fallo_binance(status_code, endpoint):
-
-    global _errores_consecutivos
-    global _ultimo_codigo_error
-    global _ultima_alerta_error
-
-    with _lock_errores:
-
-        _errores_consecutivos += 1
-        _ultimo_codigo_error = status_code
-
-        contador = _errores_consecutivos
-        ahora = time.time()
-
-        debe_avisar = (
-            contador == UMBRAL_ERRORES_ALERTA
-            and ahora - _ultima_alerta_error > COOLDOWN_ALERTA_SEGUNDOS
-        )
-
-        if debe_avisar:
-            _ultima_alerta_error = ahora
-
-    if debe_avisar:
-
-        explicacion = ""
-
-        if status_code == 451:
-            explicacion = (
-                "\n\n⚠️ 451 = Binance está bloqueando las requests "
-                "que llegan desde la IP/región del servidor."
-            )
-        elif status_code == 403:
-            explicacion = "\n\n⚠️ 403 = acceso prohibido por Binance."
-        elif status_code is None:
-            explicacion = "\n\n⚠️ No está llegando respuesta de Binance."
-
-        mensaje = (
-            "🔴 BOT SIN DATOS DE BINANCE\n\n"
-            f"Últimos {contador} intentos a {endpoint} fallaron "
-            f"(código: {status_code}).\n"
-            "El bot NO está pudiendo analizar el mercado ahora mismo."
-            f"{explicacion}"
-        )
-
-        enviar_telegram(mensaje)
-
-
-def _registrar_ok_binance():
-    global _errores_consecutivos
-    with _lock_errores:
-        _errores_consecutivos = 0
-
-
-# ============================================================
-# PERSISTENCIA
-# ============================================================
-
-señales_lock = threading.Lock()
-señales_activas = {}
-
-
-def cargar_estado():
-    global señales_activas
-    if not os.path.exists(ARCHIVO_ESTADO):
+session.headers.update({"User-Agent": "futures-signal-bot-pro/2.0"})
+
+# ------------------------- ESTADO ----------------------------
+state_lock = threading.RLock()
+state = {
+    "pending": {},       # señales que esperan entrada
+    "virtual_trades": {},# operaciones que el usuario puede seguir manualmente
+    "prealerts": {},
+    "last_analysis": 0,
+    "last_universe": 0,
+    "ws_connected": False,
+    "started_at": time.time(),
+}
+
+market_lock = threading.RLock()
+live_market = {}  # symbol -> bid/ask/mark/last_event
+symbol_filters = {}  # symbol -> tickSize
+universe = []
+
+stop_event = threading.Event()
+ws_thread = None
+analysis_thread = None
+monitor_thread = None
+ws_restart_event = threading.Event()
+
+error_lock = threading.Lock()
+consecutive_binance_errors = 0
+last_binance_error = None
+last_error_alert = 0.0
+
+
+def utc_iso(ts=None):
+    if ts is None:
+        ts = time.time()
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def save_state():
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with state_lock:
+            payload = dict(state)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception as exc:
+        logger.exception("No se pudo guardar estado: %s", exc)
+
+
+def load_state():
+    global state
+    if not os.path.exists(STATE_FILE):
         return
     try:
-        with open(ARCHIVO_ESTADO, "r", encoding="utf-8") as f:
-            señales_activas = json.load(f)
-        print("Estado cargado:", len(señales_activas), "señales activas")
-    except Exception as e:
-        print("No se pudo cargar el estado previo:", e)
-        señales_activas = {}
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        with state_lock:
+            for key in state:
+                if key in loaded:
+                    state[key] = loaded[key]
+        logger.info("Estado recuperado: %d pendientes / %d trades", len(state["pending"]), len(state["virtual_trades"]))
+    except Exception as exc:
+        logger.exception("Estado corrupto/no recuperable: %s", exc)
 
 
-def guardar_estado():
-    try:
-        with señales_lock:
-            copia = dict(señales_activas)
-        with open(ARCHIVO_ESTADO, "w", encoding="utf-8") as f:
-            json.dump(copia, f)
-    except Exception as e:
-        print("No se pudo guardar el estado:", e)
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def enviar_telegram(mensaje):
+# ------------------------- TELEGRAM --------------------------
+def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram no configurado.")
+        logger.warning("Telegram no configurado.")
         return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
-        respuesta = session.post(
-            url, json={"chat_id": TELEGRAM_CHAT_ID, "text": mensaje}, timeout=15
-        )
-        if respuesta.status_code != 200:
-            print("Error Telegram:", respuesta.text)
+        r = session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=12)
+        if r.status_code != 200:
+            logger.error("Telegram %s: %s", r.status_code, r.text[:300])
             return False
         return True
-    except Exception as e:
-        print("Error enviando Telegram:", e)
+    except Exception as exc:
+        logger.error("Telegram error: %s", exc)
         return False
 
 
-# ============================================================
-# BINANCE REQUEST
-# ============================================================
-
-def binance_get(endpoint, params=None, reintentos=2):
-
-    for intento in range(reintentos + 1):
-
+# ------------------------- BINANCE REST ----------------------
+def binance_get(endpoint, params=None, retries=3):
+    global consecutive_binance_errors, last_binance_error
+    for attempt in range(retries):
         try:
-            respuesta = session.get(
-                BINANCE_URL + endpoint, params=params, timeout=10
-            )
-
-            if respuesta.status_code in (429, 418):
-                retry_after = respuesta.headers.get("Retry-After")
+            r = session.get(BINANCE_URL + endpoint, params=params, timeout=10)
+            if r.status_code == 200:
+                with error_lock:
+                    consecutive_binance_errors = 0
+                    last_binance_error = None
+                return r.json()
+            if r.status_code in (418, 429):
+                retry_after = r.headers.get("Retry-After")
                 try:
-                    espera = max(int(retry_after), ESPERA_MINIMA_RATE_LIMIT)
+                    wait = max(2, min(int(retry_after), 60))
                 except (TypeError, ValueError):
-                    espera = ESPERA_MINIMA_RATE_LIMIT
-                print(f"Rate limit Binance ({respuesta.status_code}). Esperando {espera}s.")
-                time.sleep(espera)
+                    wait = min(2 ** attempt, 30)
+                logger.warning("Rate limit Binance %s; esperando %ss", r.status_code, wait)
+                time.sleep(wait)
                 continue
-
-            if respuesta.status_code in (451, 403):
-                print("Error Binance:", respuesta.status_code, endpoint)
-                _registrar_fallo_binance(respuesta.status_code, endpoint)
-                return None
-
-            if respuesta.status_code != 200:
-                print("Error Binance:", respuesta.status_code, endpoint)
-                _registrar_fallo_binance(respuesta.status_code, endpoint)
-                return None
-
-            _registrar_ok_binance()
-            return respuesta.json()
-
-        except Exception as e:
-            print("Error conexión Binance:", e)
-            time.sleep(2)
-
-    _registrar_fallo_binance(None, endpoint)
+            with error_lock:
+                consecutive_binance_errors += 1
+                last_binance_error = r.status_code
+            logger.error("Binance REST %s %s: %s", r.status_code, endpoint, r.text[:250])
+            return None
+        except Exception as exc:
+            logger.warning("Binance REST intento %d/%d: %s", attempt + 1, retries, exc)
+            time.sleep(min(2 ** attempt, 8))
+    with error_lock:
+        consecutive_binance_errors += 1
+        last_binance_error = "NETWORK"
     return None
 
 
-# ============================================================
-# CONTRATOS DISPONIBLES
-# ============================================================
-
-def obtener_contratos():
-
+def get_exchange_info():
     data = binance_get("/fapi/v1/exchangeInfo")
-
     if not data:
         return []
-
-    resultado = []
-
+    contracts = []
+    filters = {}
     for item in data.get("symbols", []):
-        try:
-            if item.get("status") != "TRADING":
-                continue
-            if item.get("contractType") != "PERPETUAL":
-                continue
-            if item.get("quoteAsset") != "USDT":
-                continue
-            symbol = item.get("symbol")
-            if symbol and symbol.endswith("USDT"):
-                resultado.append(symbol)
-        except Exception:
+        if item.get("status") != "TRADING":
             continue
+        if item.get("contractType") != "PERPETUAL":
+            continue
+        if item.get("quoteAsset") != "USDT":
+            continue
+        symbol = item.get("symbol")
+        if not symbol or not symbol.endswith("USDT"):
+            continue
+        contracts.append(symbol)
+        tick = None
+        for f in item.get("filters", []):
+            if f.get("filterType") == "PRICE_FILTER":
+                tick = f.get("tickSize")
+                break
+        if tick:
+            filters[symbol] = float(tick)
+    symbol_filters.clear()
+    symbol_filters.update(filters)
+    return contracts
 
-    return resultado
 
-
-# ============================================================
-# VOLUMEN 24 HORAS
-# ============================================================
-
-def obtener_volumenes():
-
+def get_24h_volumes():
     data = binance_get("/fapi/v1/ticker/24hr")
-
+    result = {}
     if not data:
-        return {}
-
-    resultado = {}
-
+        return result
     for item in data:
         try:
-            symbol = item.get("symbol")
-            if not symbol or not symbol.endswith("USDT"):
-                continue
-            resultado[symbol] = float(item.get("quoteVolume", 0))
+            s = item.get("symbol")
+            if s and s.endswith("USDT"):
+                result[s] = float(item.get("quoteVolume", 0))
         except Exception:
-            continue
+            pass
+    return result
 
-    return resultado
 
-
-# ============================================================
-# KLINES
-# ============================================================
-
-def obtener_velas(symbol, timeframe, limit=120):
-
-    data = binance_get(
-        "/fapi/v1/klines",
-        {"symbol": symbol, "interval": timeframe, "limit": limit}
-    )
-
+def get_klines(symbol, interval, limit=150, closed_only=True):
+    data = binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
     if not data:
         return None
-
-    velas = []
-
+    if closed_only and len(data) > 1:
+        data = data[:-1]  # CRÍTICO: nunca usar vela abierta para confirmar señal.
     try:
-        for x in data:
-            velas.append({
-                "open": float(x[1]), "high": float(x[2]),
-                "low": float(x[3]), "close": float(x[4]),
-                "volume": float(x[5])
-            })
-        return velas
+        return [{
+            "open": float(x[1]), "high": float(x[2]), "low": float(x[3]),
+            "close": float(x[4]), "volume": float(x[5]), "time": int(x[0])
+        } for x in data]
     except Exception:
         return None
 
 
-# ============================================================
-# MARK PRICE + FUNDING
-# ============================================================
-
-def obtener_mark_y_funding(symbol):
-
-    data = binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
-
-    if not data:
-        return None, None
-
-    try:
-        mark = float(data["markPrice"])
-        funding = float(data["lastFundingRate"]) * 100
-        return mark, funding
-    except Exception:
-        return None, None
-
-
-# ============================================================
-# OPEN INTEREST
-# ============================================================
-
-def obtener_open_interest(symbol):
-
-    data = binance_get("/fapi/v1/openInterest", {"symbol": symbol})
-
-    if not data:
-        return None
-
-    try:
-        return float(data["openInterest"])
-    except Exception:
-        return None
+def get_futures_context(symbol):
+    premium = binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+    oi = binance_get("/fapi/v1/openInterest", {"symbol": symbol})
+    funding = None
+    mark = None
+    if premium:
+        try:
+            mark = float(premium.get("markPrice"))
+            funding = float(premium.get("lastFundingRate")) * 100.0
+        except Exception:
+            pass
+    open_interest = None
+    if oi:
+        try:
+            open_interest = float(oi.get("openInterest"))
+        except Exception:
+            pass
+    return {"mark": mark, "funding": funding, "open_interest": open_interest}
 
 
-# ============================================================
-# EMA
-# ============================================================
-
-def calcular_ema(valores, periodo):
-    if len(valores) < periodo:
-        return None
-    k = 2 / (periodo + 1)
-    resultado = valores[0]
-    for valor in valores[1:]:
-        resultado = valor * k + resultado * (1 - k)
-    return resultado
-
-
-def calcular_ema_series(valores, periodo):
-    if not valores:
+# ------------------------- INDICADORES -----------------------
+def ema_series(values, period):
+    if len(values) < period:
         return []
-    k = 2 / (periodo + 1)
-    resultado = [valores[0]]
-    for valor in valores[1:]:
-        resultado.append(valor * k + resultado[-1] * (1 - k))
-    return resultado
+    k = 2.0 / (period + 1.0)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
 
 
-# ============================================================
-# RSI
-# ============================================================
-
-def calcular_rsi(cierres, periodo=14):
-    if len(cierres) < periodo + 1:
-        return 50
-    ganancias = []
-    perdidas = []
-    for i in range(1, len(cierres)):
-        cambio = cierres[i] - cierres[i - 1]
-        if cambio > 0:
-            ganancias.append(cambio)
-            perdidas.append(0)
-        else:
-            ganancias.append(0)
-            perdidas.append(abs(cambio))
-    promedio_ganancia = sum(ganancias[-periodo:]) / periodo
-    promedio_perdida = sum(perdidas[-periodo:]) / periodo
-    if promedio_perdida == 0:
-        return 100
-    rs = promedio_ganancia / promedio_perdida
-    return 100 - (100 / (1 + rs))
+def ema(values, period):
+    s = ema_series(values, period)
+    return s[-1] if s else None
 
 
-# ============================================================
-# STOCH RSI
-# ============================================================
-
-def calcular_stoch_rsi(cierres, periodo_rsi=14, periodo_stoch=14):
-
-    if len(cierres) < (periodo_rsi + periodo_stoch + 2):
-        return 50
-
-    valores_rsi = []
-    inicio = periodo_rsi + 1
-
-    for i in range(inicio, len(cierres) + 1):
-        ventana = cierres[:i]
-        valores_rsi.append(calcular_rsi(ventana, periodo_rsi))
-
-    if len(valores_rsi) < periodo_stoch:
-        return 50
-
-    ventana_rsi = valores_rsi[-periodo_stoch:]
-    minimo = min(ventana_rsi)
-    maximo = max(ventana_rsi)
-
-    if maximo == minimo:
-        return 50
-
-    return ((valores_rsi[-1] - minimo) / (maximo - minimo)) * 100
+def rsi(values, period=14):
+    if len(values) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        d = values[i] - values[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
 
 
-# ============================================================
-# MACD
-# ============================================================
-
-def calcular_macd(cierres):
-    if len(cierres) < 35:
-        return 0, 0
-    ema12 = calcular_ema_series(cierres, 12)
-    ema26 = calcular_ema_series(cierres, 26)
-    linea_macd = [a - b for a, b in zip(ema12, ema26)]
-    señal = calcular_ema_series(linea_macd, 9)
-    return linea_macd[-1], señal[-1]
+def stoch_rsi(values, rsi_period=14, stoch_period=14):
+    if len(values) < rsi_period + stoch_period + 5:
+        return 50.0
+    rsis = [rsi(values[:i], rsi_period) for i in range(rsi_period + 1, len(values) + 1)]
+    window = rsis[-stoch_period:]
+    lo, hi = min(window), max(window)
+    if hi == lo:
+        return 50.0
+    return (rsis[-1] - lo) / (hi - lo) * 100.0
 
 
-# ============================================================
-# ATR
-# ============================================================
+def macd(values):
+    e12, e26 = ema_series(values, 12), ema_series(values, 26)
+    if not e12 or not e26:
+        return 0.0, 0.0, 0.0
+    line = [a - b for a, b in zip(e12, e26)]
+    sig = ema_series(line, 9)
+    if not sig:
+        return line[-1], 0.0, 0.0
+    return line[-1], sig[-1], line[-1] - sig[-1]
 
-def calcular_atr(velas, periodo=14):
-    if len(velas) < periodo + 2:
+
+def atr(candles, period=14):
+    if len(candles) < period + 2:
         return None
-    tr = []
-    for i in range(1, len(velas)):
-        actual, anterior = velas[i], velas[i - 1]
-        rango = max(
-            actual["high"] - actual["low"],
-            abs(actual["high"] - anterior["close"]),
-            abs(actual["low"] - anterior["close"])
-        )
-        tr.append(rango)
-    return sum(tr[-periodo:]) / periodo
+    trs = []
+    for i in range(1, len(candles)):
+        c, p = candles[i], candles[i - 1]
+        trs.append(max(c["high"] - c["low"], abs(c["high"] - p["close"]), abs(c["low"] - p["close"])))
+    return sum(trs[-period:]) / period
 
 
-# ============================================================
-# ADX
-# ============================================================
-
-def calcular_adx(velas, periodo=14):
-    if len(velas) < periodo + 2:
-        return 0, 0, 0
-    trs, positivos, negativos = [], [], []
-    for i in range(1, len(velas)):
-        actual, anterior = velas[i], velas[i - 1]
-        tr = max(
-            actual["high"] - actual["low"],
-            abs(actual["high"] - anterior["close"]),
-            abs(actual["low"] - anterior["close"])
-        )
-        movimiento_up = actual["high"] - anterior["high"]
-        movimiento_down = anterior["low"] - actual["low"]
-        plus_dm = movimiento_up if (movimiento_up > movimiento_down and movimiento_up > 0) else 0
-        minus_dm = movimiento_down if (movimiento_down > movimiento_up and movimiento_down > 0) else 0
-        trs.append(tr)
-        positivos.append(plus_dm)
-        negativos.append(minus_dm)
-
-    tr14 = sum(trs[-periodo:])
-    if tr14 == 0:
-        return 0, 0, 0
-    plus_di = 100 * sum(positivos[-periodo:]) / tr14
-    minus_di = 100 * sum(negativos[-periodo:]) / tr14
-    suma = plus_di + minus_di
-    if suma == 0:
-        return 0, plus_di, minus_di
-    dx = 100 * abs(plus_di - minus_di) / suma
-    return dx, plus_di, minus_di
+def adx(candles, period=14):
+    if len(candles) < period + 3:
+        return 0.0, 0.0, 0.0
+    trs, plus, minus = [], [], []
+    for i in range(1, len(candles)):
+        c, p = candles[i], candles[i - 1]
+        trs.append(max(c["high"] - c["low"], abs(c["high"] - p["close"]), abs(c["low"] - p["close"])))
+        up = c["high"] - p["high"]
+        down = p["low"] - c["low"]
+        plus.append(up if up > down and up > 0 else 0.0)
+        minus.append(down if down > up and down > 0 else 0.0)
+    trn = sum(trs[-period:])
+    if trn <= 0:
+        return 0.0, 0.0, 0.0
+    pdi = 100.0 * sum(plus[-period:]) / trn
+    mdi = 100.0 * sum(minus[-period:]) / trn
+    den = pdi + mdi
+    dx = 100.0 * abs(pdi - mdi) / den if den else 0.0
+    return dx, pdi, mdi
 
 
-# ============================================================
-# VWAP
-# ============================================================
-
-def calcular_vwap(velas):
-    volumen_total = 0
-    precio_volumen = 0
-    for vela in velas[-50:]:
-        precio_tipico = (vela["high"] + vela["low"] + vela["close"]) / 3
-        volumen = vela["volume"]
-        volumen_total += volumen
-        precio_volumen += precio_tipico * volumen
-    if volumen_total == 0:
+def vwap(candles, n=50):
+    c = candles[-n:]
+    vol = sum(x["volume"] for x in c)
+    if vol <= 0:
         return None
-    return precio_volumen / volumen_total
+    return sum(((x["high"] + x["low"] + x["close"]) / 3.0) * x["volume"] for x in c) / vol
 
 
-# ============================================================
-# BOLLINGER
-# ============================================================
-
-def calcular_bollinger(cierres, periodo=20, desviaciones=2):
-    if len(cierres) < periodo:
+def bollinger(values, period=20, deviations=2):
+    if len(values) < period:
         return None, None, None
-    sma = sum(cierres[-periodo:]) / periodo
-    std = np.std(cierres[-periodo:])
-    banda_superior = sma + (std * desviaciones)
-    banda_inferior = sma - (std * desviaciones)
-    return banda_superior, sma, banda_inferior
+    w = np.array(values[-period:], dtype=float)
+    mid = float(np.mean(w))
+    sd = float(np.std(w))
+    return mid + deviations * sd, mid, mid - deviations * sd
 
 
-# ============================================================
-# SOPORTE Y RESISTENCIA
-# ============================================================
-
-def calcular_niveles(velas):
-    if len(velas) < 30:
-        return None, None
-    ultimas = velas[-80:]
-    soporte = min(x["low"] for x in ultimas)
-    resistencia = max(x["high"] for x in ultimas)
-    return soporte, resistencia
+def support_resistance(candles, n=80):
+    c = candles[-n:]
+    return min(x["low"] for x in c), max(x["high"] for x in c)
 
 
-# ============================================================
-# FIBONACCI
-# ============================================================
-
-def calcular_fibonacci(velas):
-    if len(velas) < 50:
+def fibonacci(candles, n=100):
+    c = candles[-n:]
+    hi, lo = max(x["high"] for x in c), min(x["low"] for x in c)
+    d = hi - lo
+    if d <= 0:
         return {}
-    ultimas = velas[-100:]
-    maximo = max(x["high"] for x in ultimas)
-    minimo = min(x["low"] for x in ultimas)
-    diferencia = maximo - minimo
-    if diferencia <= 0:
-        return {}
-    return {
-        "0.382": maximo - diferencia * 0.382,
-        "0.500": maximo - diferencia * 0.500,
-        "0.618": maximo - diferencia * 0.618,
-        "0.786": maximo - diferencia * 0.786
-    }
+    return {"0.382": hi - d * .382, "0.500": hi - d * .5, "0.618": hi - d * .618, "0.786": hi - d * .786}
 
 
-# ============================================================
-# VOLUMEN
-# ============================================================
-
-def calcular_ratio_volumen(velas):
-    if len(velas) < 25:
-        return 1
-    actual = velas[-1]["volume"]
-    promedio = sum(x["volume"] for x in velas[-21:-1]) / 20
-    if promedio == 0:
-        return 1
-    return actual / promedio
+def volume_ratio(candles):
+    if len(candles) < 25:
+        return 1.0
+    avg = sum(x["volume"] for x in candles[-21:-1]) / 20.0
+    return candles[-1]["volume"] / avg if avg else 1.0
 
 
-# ============================================================
-# TENDENCIA
-# ============================================================
-
-def determinar_tendencia(velas):
-    cierres = [x["close"] for x in velas]
-    ema20 = calcular_ema(cierres[-80:], 20)
-    ema50 = calcular_ema(cierres[-100:], 50)
-    precio = cierres[-1]
-    if not ema20 or not ema50:
+def trend(candles):
+    closes = [x["close"] for x in candles]
+    e20, e50 = ema(closes, 20), ema(closes, 50)
+    if e20 is None or e50 is None:
         return "NEUTRAL"
-    if precio > ema20 and ema20 > ema50:
+    if closes[-1] > e20 > e50:
         return "ALCISTA"
-    if precio < ema20 and ema20 < ema50:
+    if closes[-1] < e20 < e50:
         return "BAJISTA"
     return "NEUTRAL"
 
 
-# ============================================================
-# DIVERGENCIA RSI
-# ============================================================
-
-def detectar_divergencia(velas):
-    if len(velas) < 40:
+def divergence(candles, lookback=10):
+    if len(candles) < 50:
         return None
-    cierres = [x["close"] for x in velas]
-    rsi_anterior = calcular_rsi(cierres[:-10])
-    rsi_actual = calcular_rsi(cierres)
-    precio_anterior = cierres[-10]
-    precio_actual = cierres[-1]
-    if precio_actual < precio_anterior and rsi_actual > rsi_anterior:
+    closes = [x["close"] for x in candles]
+    a = rsi(closes[:-lookback])
+    b = rsi(closes)
+    pa, pb = closes[-lookback], closes[-1]
+    if pb < pa and b > a:
         return "ALCISTA"
-    if precio_actual > precio_anterior and rsi_actual < rsi_anterior:
+    if pb > pa and b < a:
         return "BAJISTA"
     return None
 
 
-# ============================================================
-# ANALISIS DE UNA TEMPORALIDAD
-# ============================================================
+def analyze_tf(candles):
+    closes = [x["close"] for x in candles]
+    m, ms, mh = macd(closes)
+    adxv, pdi, mdi = adx(candles)
+    a = atr(candles)
+    sup, res = support_resistance(candles)
+    bbu, bbm, bbl = bollinger(closes)
+    price = closes[-1]
+    return {
+        "price": price,
+        "rsi": rsi(closes),
+        "stoch_rsi": stoch_rsi(closes),
+        "ema20": ema(closes, 20),
+        "ema50": ema(closes, 50),
+        "macd": m,
+        "macd_signal": ms,
+        "macd_hist": mh,
+        "adx": adxv,
+        "plus_di": pdi,
+        "minus_di": mdi,
+        "atr": a,
+        "atr_pct": a / price * 100 if a else 0,
+        "vwap": vwap(candles),
+        "support": sup,
+        "resistance": res,
+        "fib": fibonacci(candles),
+        "volume_ratio": volume_ratio(candles),
+        "trend": trend(candles),
+        "divergence": divergence(candles),
+        "bb_upper": bbu,
+        "bb_mid": bbm,
+        "bb_lower": bbl,
+        "last_closed_time": candles[-1]["time"],
+    }
 
-def analizar_temporalidad(velas):
 
-    cierres = [x["close"] for x in velas]
+# ------------------------- LIVE MARKET -----------------------
+def live_price(symbol):
+    with market_lock:
+        x = live_market.get(symbol, {}).copy()
+    if not x:
+        return None
+    bid, ask, mark = x.get("bid"), x.get("ask"), x.get("mark")
+    if bid and ask:
+        return (bid + ask) / 2.0
+    return mark or x.get("last")
 
-    macd_linea, macd_signal = calcular_macd(cierres)
-    adx_value, plus_di, minus_di = calcular_adx(velas)
-    soporte, resistencia = calcular_niveles(velas)
-    atr_value = calcular_atr(velas)
-    bb_superior, bb_sma, bb_inferior = calcular_bollinger(cierres)
-    stoch_rsi = calcular_stoch_rsi(cierres)
+
+def live_snapshot(symbol):
+    with market_lock:
+        return dict(live_market.get(symbol, {}))
+
+
+def websocket_url(symbols):
+    streams = []
+    for s in symbols:
+        sl = s.lower()
+        streams.append(f"{sl}@bookTicker")
+        streams.append(f"{sl}@markPrice@1s")
+    return WS_URL + "?" + urlencode({"streams": "/".join(streams)})
+
+
+def ws_on_message(_ws, message):
+    try:
+        obj = json.loads(message)
+        data = obj.get("data", obj)
+        stream = obj.get("stream", "")
+        event = data.get("e")
+        symbol = data.get("s")
+        if not symbol and stream:
+            symbol = stream.split("@")[0].upper()
+        if not symbol:
+            return
+        now = time.time()
+        with market_lock:
+            item = live_market.setdefault(symbol, {})
+            if event == "bookTicker" or "b" in data and "a" in data:
+                item["bid"] = float(data.get("b"))
+                item["ask"] = float(data.get("a"))
+                item["last_event"] = now
+            elif event == "markPriceUpdate" or "p" in data:
+                item["mark"] = float(data.get("p"))
+                item["last_event"] = now
+    except Exception as exc:
+        logger.debug("WS parse error: %s", exc)
+
+
+def ws_on_open(_ws):
+    with state_lock:
+        state["ws_connected"] = True
+    logger.info("Binance WebSocket conectado.")
+
+
+def ws_on_error(_ws, error):
+    logger.warning("Binance WebSocket error: %s", error)
+
+
+def ws_on_close(_ws, code, msg):
+    with state_lock:
+        state["ws_connected"] = False
+    logger.warning("Binance WebSocket cerrado: %s %s", code, msg)
+
+
+def websocket_loop():
+    while not stop_event.is_set():
+        symbols = list(universe)
+        if not symbols:
+            stop_event.wait(10)
+            continue
+        url = websocket_url(symbols)
+        ws = None
+        try:
+            ws = websocket.WebSocketApp(url, on_open=ws_on_open, on_message=ws_on_message, on_error=ws_on_error, on_close=ws_on_close)
+            ws_restart_event.clear()
+            def _watch_restart():
+                while not stop_event.is_set() and not ws_restart_event.is_set():
+                    time.sleep(0.5)
+                if ws_restart_event.is_set():
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+            watcher = threading.Thread(target=_watch_restart, name="ws-restart-watch", daemon=True)
+            watcher.start()
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as exc:
+            logger.warning("WS excepción: %s", exc)
+        finally:
+            with state_lock:
+                state["ws_connected"] = False
+        stop_event.wait(1 if ws_restart_event.is_set() else 3)
+
+
+# ------------------------- UNIVERSO --------------------------
+def select_universe():
+    contracts = get_exchange_info()
+    volumes = get_24h_volumes()
+    candidates = []
+    for symbol in contracts:
+        vol = volumes.get(symbol, 0)
+        if vol < MIN_VOLUME_24H:
+            continue
+        candles = get_klines(symbol, "4h", 70, closed_only=True)
+        if not candles:
+            continue
+        a = atr(candles)
+        price = candles[-1]["close"]
+        if not a or price <= 0:
+            continue
+        volat = a / price * 100
+        candidates.append((symbol, volat, vol))
+        time.sleep(0.08)
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda x: x[1])
+    calm = candidates[: max(10, TOTAL_MONEDAS - 10)]
+    liquid_volatile = sorted([x for x in candidates if x[2] >= 40_000_000], key=lambda x: x[1], reverse=True)[:10]
+    combined = calm + liquid_volatile
+    result = []
+    seen = set()
+    for s, _, _ in combined:
+        if s not in seen:
+            seen.add(s)
+            result.append(s)
+        if len(result) >= TOTAL_MONEDAS:
+            break
+    logger.info("Universo actualizado: %d símbolos", len(result))
+    return result
+
+
+# ------------------------- SIGNAL ENGINE ---------------------
+def funding_class(funding):
+    if funding is None:
+        return "NEUTRAL", "⚪"
+    if funding < FUNDING_INFRA_PCT:
+        return "INFRAVALORADA", "🟢"
+    if funding > FUNDING_SOBRE_PCT:
+        return "SOBREVALORADA", "🔴"
+    return "NEUTRAL", "⚪"
+
+
+def risk_leverage(score, adx1h, vol_pct):
+    # Nunca aumenta leverage solo porque el mercado esté más volátil.
+    # Volatilidad alta reduce leverage.
+    lev = 5
+    if score >= 9 and adx1h >= 25:
+        lev = 6
+    if score >= 10 and adx1h >= 30 and vol_pct < 1.8:
+        lev = 7
+    if score >= 11 and adx1h >= 32 and vol_pct < 1.4:
+        lev = 8
+    if score >= 12 and adx1h >= 35 and vol_pct < 1.0:
+        lev = 9
+    return max(MIN_LEVERAGE, min(MAX_LEVERAGE, lev))
+
+
+def confluence(d):
+    long_s = short_s = 0
+    lm, sm = [], []
+
+    for tf, pts in (("1d", 3), ("4h", 3), ("1h", 2)):
+        t = d[tf]["trend"]
+        if t == "ALCISTA":
+            long_s += pts
+            lm.append(f"{tf} alcista")
+        elif t == "BAJISTA":
+            short_s += pts
+            sm.append(f"{tf} bajista")
+
+    r = d["1h"]["rsi"]
+    if r <= 42:
+        long_s += 1; lm.append(f"RSI 1H {r:.1f}")
+    elif r >= 58:
+        short_s += 1; sm.append(f"RSI 1H {r:.1f}")
+
+    div = d["1h"]["divergence"]
+    if div == "ALCISTA": long_s += 1; lm.append("divergencia alcista")
+    if div == "BAJISTA": short_s += 1; sm.append("divergencia bajista")
+
+    mh = d["1h"]["macd_hist"]
+    if mh > 0: long_s += 1; lm.append("MACD 1H positivo")
+    elif mh < 0: short_s += 1; sm.append("MACD 1H negativo")
+
+    a = d["1h"]["adx"]
+    if a >= 20:
+        if d["1h"]["plus_di"] > d["1h"]["minus_di"]:
+            long_s += 1; lm.append(f"ADX {a:.1f} a favor")
+        elif d["1h"]["minus_di"] > d["1h"]["plus_di"]:
+            short_s += 1; sm.append(f"ADX {a:.1f} a favor")
+
+    v = d["15m"]["volume_ratio"]
+    if v >= 1.20:
+        if long_s > short_s: long_s += 1; lm.append(f"volumen 15M {v:.1f}x")
+        elif short_s > long_s: short_s += 1; sm.append(f"volumen 15M {v:.1f}x")
+
+    p, vw = d["1h"]["price"], d["1h"]["vwap"]
+    if vw:
+        if p > vw: long_s += 1; lm.append("sobre VWAP 1H")
+        elif p < vw: short_s += 1; sm.append("bajo VWAP 1H")
+
+    if long_s >= MIN_SCORE and long_s >= short_s + 2:
+        return "LONG", long_s, lm
+    if short_s >= MIN_SCORE and short_s >= long_s + 2:
+        return "SHORT", short_s, sm
+    return None, max(long_s, short_s), []
+
+
+def build_analysis(symbol):
+    d = {}
+    for tf in ("1d", "4h", "1h", "15m", "5m"):
+        candles = get_klines(symbol, tf, 150, closed_only=True)
+        if not candles or len(candles) < 60:
+            return None
+        d[tf] = analyze_tf(candles)
+        time.sleep(0.08)
+    d["futures"] = get_futures_context(symbol)
+    return d
+
+
+def find_entry_zone(d, direction):
+    p = d["1h"]["price"]
+    a = d["4h"]["atr"]
+    if not a:
+        return None
+    levels = []
+    if direction == "LONG":
+        if d["4h"]["support"] < p: levels.append(d["4h"]["support"])
+        for k in ("0.618", "0.786"):
+            x = d["4h"]["fib"].get(k)
+            if x and x < p: levels.append(x)
+        vw = d["4h"]["vwap"]
+        if vw and vw < p: levels.append(vw)
+        if not levels: return None
+        center = max(levels)
+    else:
+        if d["4h"]["resistance"] > p: levels.append(d["4h"]["resistance"])
+        for k in ("0.382", "0.500", "0.618"):
+            x = d["4h"]["fib"].get(k)
+            if x and x > p: levels.append(x)
+        vw = d["4h"]["vwap"]
+        if vw and vw > p: levels.append(vw)
+        if not levels: return None
+        center = min(levels)
+    width = a * ENTRY_ATR_WIDTH
+    return center - width, center + width, center
+
+
+def current_entry_price(symbol):
+    return live_price(symbol)
+
+
+def make_plan(symbol, d, direction, score, zone):
+    zone_min, zone_max, center = zone
+    entry = center
+    a = d["1h"]["atr"]
+    a4 = d["4h"]["atr"]
+    if not a or not a4:
+        return None
+
+    if direction == "LONG":
+        structural = min(zone_min, d["1h"]["support"])
+        stop = structural - a * 0.15
+        tp1 = entry + a * 1.8
+        tp2 = entry + a * 3.0
+    else:
+        structural = max(zone_max, d["1h"]["resistance"])
+        stop = structural + a * 0.15
+        tp1 = entry - a * 1.8
+        tp2 = entry - a * 3.0
+
+    stop_pct = abs(entry - stop) / entry * 100
+    if stop_pct <= 0 or stop_pct > MAX_STOP_PCT:
+        return None
+
+    risk = abs(entry - stop)
+    rr1 = abs(tp1 - entry) / risk
+    rr2 = abs(tp2 - entry) / risk
+    if rr1 < MIN_RR_TP1 or rr2 < MIN_RR_TP2:
+        return None
+
+    lev = risk_leverage(score, d["1h"]["adx"], d["1h"]["atr_pct"])
+    move2 = abs(tp2 - entry) / entry * 100
+    gross = move2 * lev
+    fees = TAKER_FEE_PCT_PER_SIDE * 2
+    net = gross - fees
+    if net < MIN_NET_TP2:
+        return None
+
+    funding, = (d["futures"].get("funding"),)
+    valuation, emoji = funding_class(funding)
+    aligned = (direction == "LONG" and valuation == "INFRAVALORADA") or (direction == "SHORT" and valuation == "SOBREVALORADA")
 
     return {
-        "precio": cierres[-1],
-        "rsi": calcular_rsi(cierres),
-        "stoch_rsi": stoch_rsi,
-        "ema20": calcular_ema(cierres, 20),
-        "ema50": calcular_ema(cierres, 50),
-        "macd": macd_linea,
-        "macd_signal": macd_signal,
-        "adx": adx_value,
-        "plus_di": plus_di,
-        "minus_di": minus_di,
-        "atr": atr_value,
-        "atr_pct": (atr_value / cierres[-1] * 100) if atr_value else 0,
-        "vwap": calcular_vwap(velas),
-        "soporte": soporte,
-        "resistencia": resistencia,
-        "fibonacci": calcular_fibonacci(velas),
-        "volumen_ratio": calcular_ratio_volumen(velas),
-        "tendencia": determinar_tendencia(velas),
-        "divergencia": detectar_divergencia(velas),
-        "bb_superior": bb_superior,
-        "bb_sma": bb_sma,
-        "bb_inferior": bb_inferior
+        "symbol": symbol,
+        "direction": direction,
+        "score": score,
+        "grade": "A" if score >= MIN_SCORE_GRADE_A else "B",
+        "entry_min": zone_min,
+        "entry_max": zone_max,
+        "entry": entry,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "rr1": rr1,
+        "rr2": rr2,
+        "stop_pct": stop_pct,
+        "leverage": lev,
+        "move_tp2_pct": move2,
+        "net_tp2_pct": net,
+        "funding": funding,
+        "valuation": valuation,
+        "emoji": emoji,
+        "aligned_funding": aligned,
+        "motives": [],
+        "created_at": time.time(),
+        "expires_at": time.time() + SIGNAL_TTL_SECONDS,
+        "status": "PENDING",
+        "prealert_sent": False,
+        "entered": False,
+        "entry_price_real": None,
     }
 
 
-# ============================================================
-# ANALIZAR MONEDA COMPLETA
-# ============================================================
-
-def analizar_moneda(symbol):
-
-    resultado = {}
-    temporalidades = ["1d", "4h", "1h", "15m", "5m"]
-
-    for tf in temporalidades:
-        velas = obtener_velas(symbol, tf, 120)
-        if not velas:
-            return None
-        resultado[tf] = analizar_temporalidad(velas)
-        time.sleep(PAUSA_ENTRE_VELAS)
-
-    mark, funding = obtener_mark_y_funding(symbol)
-
-    resultado["futures"] = {
-        "mark": mark,
-        "open_interest": obtener_open_interest(symbol),
-        "funding": funding
-    }
-
-    return resultado
-
-
-# ============================================================
-# SELECCIONAR 50 MONEDAS
-# ============================================================
-
-def seleccionar_monedas():
-
-    print("Seleccionando monedas...")
-
-    contratos = obtener_contratos()
-
-    if not contratos:
-        return []
-
-    volumenes = obtener_volumenes()
-
-    candidatos = []
-
-    for symbol in contratos:
-
-        volumen = volumenes.get(symbol, 0)
-
-        if volumen < 20_000_000:
-            continue
-
-        velas = obtener_velas(symbol, "4h", 80)
-
-        if not velas:
-            continue
-
-        atr_value = calcular_atr(velas)
-
-        if not atr_value:
-            continue
-
-        precio = velas[-1]["close"]
-
-        if precio <= 0:
-            continue
-
-        volatilidad = atr_value / precio * 100
-
-        candidatos.append({"symbol": symbol, "volatilidad": volatilidad, "volumen": volumen})
-
-        time.sleep(PAUSA_ENTRE_SELECCION)
-
-    if not candidatos:
-        return []
-
-    candidatos.sort(key=lambda x: x["volatilidad"])
-
-    tranquilas = candidatos[:MONEDAS_BAJA_VOLATILIDAD]
-
-    candidatos_liquidos = [c for c in candidatos if c["volumen"] >= LIQUIDEZ_MINIMA_VOLATILES]
-
-    if candidatos_liquidos:
-        volatiles = candidatos_liquidos[-MONEDAS_ALTA_VOLATILIDAD:]
-    else:
-        volatiles = candidatos[-MONEDAS_ALTA_VOLATILIDAD:]
-
-    seleccionadas = tranquilas + volatiles
-
-    resultado = []
-    vistos = set()
-
-    for x in seleccionadas:
-        symbol = x["symbol"]
-        if symbol not in vistos:
-            vistos.add(symbol)
-            resultado.append(symbol)
-
-    print("Monedas seleccionadas:", len(resultado))
-
-    return resultado[:TOTAL_MONEDAS]
-
-
-# ============================================================
-# CONFLUENCIA
-# ============================================================
-
-def calcular_confluencia(data):
-
-    long_score = 0
-    short_score = 0
-    long_motivos = []
-    short_motivos = []
-
-    if data["1d"]["tendencia"] == "ALCISTA":
-        long_score += 2
-        long_motivos.append("Tendencia 1D alcista")
-    elif data["1d"]["tendencia"] == "BAJISTA":
-        short_score += 2
-        short_motivos.append("Tendencia 1D bajista")
-
-    if data["4h"]["tendencia"] == "ALCISTA":
-        long_score += 2
-        long_motivos.append("Estructura 4H alcista")
-    elif data["4h"]["tendencia"] == "BAJISTA":
-        short_score += 2
-        short_motivos.append("Estructura 4H bajista")
-
-    rsi = data["1h"]["rsi"]
-    if rsi <= 40:
-        long_score += 1
-        long_motivos.append(f"RSI 1H bajo ({rsi:.1f})")
-    elif rsi >= 60:
-        short_score += 1
-        short_motivos.append(f"RSI 1H alto ({rsi:.1f})")
-
-    divergencia = data["1h"]["divergencia"]
-    if divergencia == "ALCISTA":
-        long_score += 1
-        long_motivos.append("Divergencia RSI alcista")
-    elif divergencia == "BAJISTA":
-        short_score += 1
-        short_motivos.append("Divergencia RSI bajista")
-
-    macd = data["1h"]["macd"]
-    macd_signal = data["1h"]["macd_signal"]
-    if macd > macd_signal:
-        long_score += 1
-        long_motivos.append("MACD 1H alcista")
-    elif macd < macd_signal:
-        short_score += 1
-        short_motivos.append("MACD 1H bajista")
-
-    adx = data["1h"]["adx"]
-    plus_di = data["1h"]["plus_di"]
-    minus_di = data["1h"]["minus_di"]
-    if adx >= 20:
-        if plus_di > minus_di:
-            long_score += 1
-            long_motivos.append(f"ADX fuerte ({adx:.1f})")
-        elif minus_di > plus_di:
-            short_score += 1
-            short_motivos.append(f"ADX fuerte ({adx:.1f})")
-
-    volumen = data["15m"]["volumen_ratio"]
-    if volumen >= 1.30:
-        if long_score > short_score:
-            long_score += 1
-            long_motivos.append(f"Volumen elevado ({volumen:.1f}x)")
-        elif short_score > long_score:
-            short_score += 1
-            short_motivos.append(f"Volumen elevado ({volumen:.1f}x)")
-
-    precio = data["1h"]["precio"]
-    vwap = data["1h"]["vwap"]
-    if vwap:
-        if precio > vwap:
-            long_score += 1
-            long_motivos.append("Precio sobre VWAP")
-        elif precio < vwap:
-            short_score += 1
-            short_motivos.append("Precio bajo VWAP")
-
-    if long_score >= MIN_SCORE and long_score > short_score:
-        return "LONG", long_score, long_motivos
-
-    if short_score >= MIN_SCORE and short_score > long_score:
-        return "SHORT", short_score, short_motivos
-
-    return None, max(long_score, short_score), []
-
-
-# ============================================================
-# BUSCAR ZONA DE ENTRADA
-# ============================================================
-
-def buscar_zona(data, direccion):
-
-    precio = data["1h"]["precio"]
-    soporte = data["4h"]["soporte"]
-    resistencia = data["4h"]["resistencia"]
-    fibonacci = data["4h"]["fibonacci"]
-    atr_value = data["4h"]["atr"]
-
-    if not atr_value:
-        return None
-
-    niveles = []
-
-    if direccion == "LONG":
-        if soporte and soporte < precio:
-            niveles.append(soporte)
-        for nombre in ["0.618", "0.786"]:
-            nivel = fibonacci.get(nombre)
-            if nivel and nivel < precio:
-                niveles.append(nivel)
-        vwap = data["4h"]["vwap"]
-        if vwap and vwap < precio:
-            niveles.append(vwap)
-        if not niveles:
-            return None
-        nivel = max(niveles)
-    else:
-        if resistencia and resistencia > precio:
-            niveles.append(resistencia)
-        for nombre in ["0.382", "0.500", "0.618"]:
-            nivel = fibonacci.get(nombre)
-            if nivel and nivel > precio:
-                niveles.append(nivel)
-        vwap = data["4h"]["vwap"]
-        if vwap and vwap > precio:
-            niveles.append(vwap)
-        if not niveles:
-            return None
-        nivel = min(niveles)
-
-    ancho = atr_value * 0.30
-
-    return nivel - ancho, nivel + ancho, nivel
-
-
-# ============================================================
-# ¿ESTA CERCA DE LA ZONA?
-# ============================================================
-
-def esta_cerca(precio, zona_min, zona_max, atr_value):
-    if zona_min <= precio <= zona_max:
-        return True
-    if precio > zona_max:
-        distancia = precio - zona_max
-    else:
-        distancia = zona_min - precio
-    return abs(distancia) <= atr_value * PREALERTA_ATR
-
-
-# ============================================================
-# MOMENTUM MINIMO
-# ============================================================
-
-def hay_momentum_minimo(data):
-    adx = data["5m"]["adx"]
-    volumen = data["5m"]["volumen_ratio"]
-    if adx < UMBRAL_ADX_MINIMO_5M:
-        return False
-    if volumen < UMBRAL_VOLUMEN_MINIMO_5M:
-        return False
-    return True
-
-
-# ============================================================
-# APALANCAMIENTO
-# ============================================================
-
-def calcular_apalancamiento(score, adx, volatilidad):
-    leverage = 5
-    if score >= 8:
-        leverage = 6
-    if score >= 9:
-        leverage = 7
-    if score >= 9 and adx >= 28 and volatilidad < 2.0:
-        leverage = 8
-    if score >= 10 and adx >= 30 and volatilidad < 1.50:
-        leverage = 10
-    return max(MIN_LEVERAGE, min(leverage, MAX_LEVERAGE))
-
-
-# ============================================================
-# TP Y STOP
-# ============================================================
-
-def calcular_tp_sl(precio, atr_value, direccion, zona_baja=None, low_20_velas=None):
-
-    tp1_distancia = atr_value * 1.50
-    tp2_distancia = atr_value * 2.50
-
-    if direccion == "LONG":
-
-        if zona_baja is not None and low_20_velas is not None:
-            stop_loss = min(zona_baja, low_20_velas) * 0.995
-        elif zona_baja is not None:
-            stop_loss = zona_baja * 0.995
-        elif low_20_velas is not None:
-            stop_loss = low_20_velas * 0.995
-        else:
-            stop_loss = precio - atr_value * 1.35
-
-        tp1 = precio + tp1_distancia
-        tp2 = precio + tp2_distancia
-
-    else:
-
-        stop_distancia = atr_value * 1.35
-        stop_loss = precio + stop_distancia
-        tp1 = precio - tp1_distancia
-        tp2 = precio - tp2_distancia
-
-    return stop_loss, tp1, tp2
-
-
-# ============================================================
-# RESULTADO ESTIMADO
-# ============================================================
-
-def calcular_ganancia(entrada, objetivo, leverage):
-    movimiento = abs(objetivo - entrada) / entrada * 100
-    resultado_bruto = movimiento * leverage
-    comision_total = COMISION_TAKER_POR_LADO * 2 * leverage
-    resultado_neto = resultado_bruto - comision_total
-    return movimiento, resultado_bruto, resultado_neto
-
-
-# ============================================================
-# FORMATO DE PRECIO
-# ============================================================
-
-def precio_texto(precio):
-    if precio >= 1000:
-        return f"{precio:,.2f}"
-    if precio >= 1:
-        return f"{precio:,.4f}"
-    if precio >= 0.01:
-        return f"{precio:.6f}"
-    return f"{precio:.10f}"
-
-
-# ============================================================
-# MENSAJE DE ENTRADA (limpio)
-# ============================================================
-
-def mandar_señal_entrada(symbol, direccion, precio, stop, tp1, tp2, funding):
-
-    valoracion, emoji = clasificar_valoracion(funding)
-    dejar_correr = debe_dejar_correr(direccion, valoracion)
-
-    funding_texto = "N/D" if funding is None else f"{funding:.3f}%"
-
-    estrategia = (
-        "Vender 50% en TP1 y 50% en TP2"
-        if dejar_correr
-        else "TP1 vender 100%"
+def round_price(symbol, price):
+    tick = symbol_filters.get(symbol)
+    if not tick or price is None:
+        return price
+    q = Decimal(str(tick))
+    return float((Decimal(str(price)) / q).quantize(Decimal("1"), rounding=ROUND_DOWN) * q)
+
+
+def fmt_price(symbol, p):
+    p = round_price(symbol, p)
+    if p is None:
+        return "N/D"
+    if p >= 1000: return f"{p:,.2f}"
+    if p >= 1: return f"{p:,.4f}"
+    if p >= .01: return f"{p:.6f}"
+    return f"{p:.10f}"
+
+
+def send_prealert(plan, price):
+    s = plan["symbol"]
+    direction = plan["direction"]
+    title = "🟡 PREALERTA LONG" if direction == "LONG" else "🟠 PREALERTA SHORT"
+    msg = (
+        f"{title} {s}\n\n"
+        f"Precio vivo: {fmt_price(s, price)}\n"
+        f"Zona: {fmt_price(s, plan['entry_min'])} – {fmt_price(s, plan['entry_max'])}\n"
+        f"⏳ Prepará Binance: la señal final llegará SOLO si confirma la entrada."
+    )
+    return send_telegram(msg)
+
+
+def send_final_signal(plan, price):
+    s, d = plan["symbol"], plan["direction"]
+    title = "🟢 ENTRADA LONG" if d == "LONG" else "🔴 ENTRADA SHORT"
+    funding = "N/D" if plan["funding"] is None else f"{plan['funding']:.3f}%"
+    valid = max(0, int(plan["expires_at"] - time.time()))
+    msg = (
+        f"{title} {s} | GRADO {plan['grade']}\n\n"
+        f"💵 Precio vivo: {fmt_price(s, price)}\n"
+        f"📍 LIMIT sugerida: {fmt_price(s, plan['entry_min'])} – {fmt_price(s, plan['entry_max'])}\n"
+        f"🛑 STOP: {fmt_price(s, plan['stop'])}\n"
+        f"🎯 TP1: {fmt_price(s, plan['tp1'])}\n"
+        f"🎯 TP2: {fmt_price(s, plan['tp2'])}\n\n"
+        f"📊 Score: {plan['score']} | R:R TP1 {plan['rr1']:.2f} | TP2 {plan['rr2']:.2f}\n"
+        f"⚙️ Apalancamiento máximo sugerido: {plan['leverage']}x\n"
+        f"💰 Movimiento TP2: +{plan['move_tp2_pct']:.2f}% | estimado neto con 2 taker: +{plan['net_tp2_pct']:.2f}%\n"
+        f"{plan['emoji']} Funding: {funding} ({plan['valuation']})\n\n"
+        f"⏱️ SEÑAL VÁLIDA {valid//60}m {valid%60:02d}s\n"
+        f"⚠️ Si el precio sale de la zona o vence el tiempo: NO ENTRAR.\n"
+        f"👤 Orden MANUAL. El bot NO compra."
+    )
+    return send_telegram(msg)
+
+
+def send_expired(plan, reason="Tiempo agotado"):
+    s = plan["symbol"]
+    send_telegram(f"⚪ SEÑAL CANCELADA {s}\n\n{reason}.\nNo colocar la orden con la señal vieja.")
+
+
+def send_entry_touched(plan, price):
+    s = plan["symbol"]
+    send_telegram(
+        f"🟢 ZONA DE ENTRADA TOCADA {s}\n\n"
+        f"Precio vivo: {fmt_price(s, price)}\n"
+        f"Zona: {fmt_price(s, plan['entry_min'])} – {fmt_price(s, plan['entry_max'])}\n"
+        f"La orden LIMIT debe respetar la zona."
     )
 
-    if direccion == "LONG":
-        titulo = "🟢 COMPRAR"
-        etiqueta_precio = "Precio de compra"
-    else:
-        titulo = "🔴 VENDER"
-        etiqueta_precio = "Precio de venta"
 
-    mensaje = (
-        f"{titulo} {symbol}\n"
-        f"{etiqueta_precio} $ {precio_texto(precio)}\n"
-        f"TP 2 $ {precio_texto(tp2)}\n"
-        f"TP 1 $ {precio_texto(tp1)}\n"
-        f"STOP LOSS $ {precio_texto(stop)}\n"
-        f"{emoji} {valoracion.capitalize()} Funding {funding_texto} - {estrategia}"
+def send_virtual_exit(trade, price, reason):
+    s, d = trade["symbol"], trade["direction"]
+    entry = trade["entry_price_real"] or trade["entry"]
+    pnl = ((price - entry) / entry * 100) if d == "LONG" else ((entry - price) / entry * 100)
+    sign = "+" if pnl >= 0 else ""
+    send_telegram(
+        f"{'🟢' if pnl >= 0 else '🔴'} SALIDA {s}\n"
+        f"Motivo: {reason}\n"
+        f"Precio: {fmt_price(s, price)}\n"
+        f"Resultado precio: {sign}{pnl:.2f}%\n"
+        f"⚠️ Seguimiento virtual/manual: el bot no ejecutó la operación."
     )
 
-    enviar_telegram(mensaje)
 
-    return valoracion, emoji, dejar_correr
-
-
-# ============================================================
-# MENSAJES DE SALIDA
-# ============================================================
-
-def calcular_ganancia_pct(entrada, precio_actual, direccion):
-    if direccion == "LONG":
-        return (precio_actual - entrada) / entrada * 100
-    else:
-        return (entrada - precio_actual) / entrada * 100
-
-
-def mandar_venta_total(symbol, precio_venta, ganancia_pct, valoracion, emoji, funding, motivo):
-
-    funding_texto = "N/D" if funding is None else f"{funding:.3f}%"
-    signo = "+" if ganancia_pct >= 0 else ""
-
-    mensaje = (
-        f"{emoji} VENTA TOTAL {symbol}\n"
-        f"Precio de venta $ {precio_texto(precio_venta)}\n"
-        f"Ganancia total {signo}{ganancia_pct:.2f}%\n"
-        f"{emoji} {valoracion.capitalize()} Funding {funding_texto} - {motivo}"
-    )
-
-    enviar_telegram(mensaje)
-
-
-def mandar_venta_parcial(symbol, precio_venta, ganancia_pct, valoracion, funding, motivo):
-
-    funding_texto = "N/D" if funding is None else f"{funding:.3f}%"
-    signo = "+" if ganancia_pct >= 0 else ""
-    emoji_valoracion = "🟢" if valoracion == "INFRAVALORADA" else ("🔴" if valoracion == "SOBREVALORADA" else "⚪")
-
-    mensaje = (
-        f"🟡 VENTA PARCIAL 50% {symbol}\n"
-        f"Precio de venta $ {precio_texto(precio_venta)}\n"
-        f"Ganancia {signo}{ganancia_pct:.2f}%\n"
-        f"{emoji_valoracion} {valoracion.capitalize()} Funding {funding_texto} - {motivo}"
-    )
-
-    enviar_telegram(mensaje)
-
-
-def mandar_stop_alcanzado(symbol, precio_venta, perdida_pct, valoracion, emoji, funding):
-
-    funding_texto = "N/D" if funding is None else f"{funding:.3f}%"
-
-    mensaje = (
-        f"🔴 VENTA TOTAL (STOP LOSS) {symbol}\n"
-        f"Precio de venta $ {precio_texto(precio_venta)}\n"
-        f"Pérdida {perdida_pct:.2f}%\n"
-        f"{emoji} {valoracion.capitalize()} Funding {funding_texto} - Stop Loss alcanzado"
-    )
-
-    enviar_telegram(mensaje)
-
-
-# ============================================================
-# ENVIAR ORDEN (con todos los filtros de riesgo existentes)
-# ============================================================
-
-def mandar_orden_compra(symbol, data, direccion, score, motivos, zona):
-
-    zona_min, zona_max, nivel = zona
-    precio = data["5m"]["precio"]
-    atr_value = data["1h"]["atr"]
-
-    if not atr_value:
-        return None
-
-    rsi = data["5m"]["rsi"]
-
-    if direccion == "LONG" and rsi > 75:
-        return None
-    if direccion == "SHORT" and rsi < 25:
-        return None
-
-    velas_4h = obtener_velas(symbol, "4h", 30)
-
-    if not velas_4h:
-        return None
-
-    low_20_velas = min(vela["low"] for vela in velas_4h[-20:])
-
-    stop, tp1, tp2 = calcular_tp_sl(
-        precio, atr_value, direccion,
-        zona_baja=zona_min, low_20_velas=low_20_velas
-    )
-
-    stop_pct = abs(precio - stop) / precio * 100
-
-    if stop_pct > MAX_STOP_PCT:
-        print(symbol, "descartado: stop demasiado lejos", f"({stop_pct:.2f}%)")
-        return None
-
-    adx = data["1h"]["adx"]
-    volatilidad = data["1h"]["atr_pct"]
-    leverage = calcular_apalancamiento(score, adx, volatilidad)
-
-    movimiento, bruto, neto = calcular_ganancia(precio, tp2, leverage)
-
-    if neto < MIN_GANANCIA_NETA:
-        print(symbol, "descartado: ganancia neta", round(neto, 2))
-        return None
-
-    funding = data["futures"]["funding"]
-
-    valoracion, emoji, dejar_correr = mandar_señal_entrada(
-        symbol, direccion, precio, stop, tp1, tp2, funding
-    )
-
-    return precio, stop, tp1, tp2, funding, valoracion, emoji, dejar_correr
-
-
-# ============================================================
-# PROCESAR MONEDA
-# ============================================================
-
-def procesar_moneda(symbol):
-
+# ------------------------- PROCESS ---------------------------
+def process_symbol(symbol):
     try:
-        data = analizar_moneda(symbol)
+        # No gastar llamadas REST si ya hay una señal/trade de este símbolo.
+        with state_lock:
+            if symbol in state["pending"] or symbol in state["virtual_trades"]:
+                return
+            if len(state["pending"]) >= MAX_SIGNAL_SLOTS:
+                return
 
-        if not data:
+        d = build_analysis(symbol)
+        if not d:
             return
 
-        rsi = data["1h"]["rsi"]
-        stoch_rsi = data["1h"]["stoch_rsi"]
-
-        if rsi > RSI_MAXIMO_COMPRA or stoch_rsi > STOCH_RSI_MAXIMO_COMPRA:
-            print(symbol, "descartada por sobrecompra:", f"RSI={rsi:.1f}", f"StochRSI={stoch_rsi:.1f}")
+        direction, score, motives = confluence(d)
+        if not direction or score < MIN_SCORE:
             return
 
-        direccion, score, motivos = calcular_confluencia(data)
-
-        if not direccion:
+        # Evitar perseguir precio con 1H extremo.
+        r1 = d["1h"]["rsi"]
+        sr1 = d["1h"]["stoch_rsi"]
+        if direction == "LONG" and (r1 > RSI_OVERBOUGHT or sr1 > 90):
+            return
+        if direction == "SHORT" and (r1 < RSI_OVERSOLD or sr1 < 10):
             return
 
-        zona = buscar_zona(data, direccion)
-
-        if not zona:
+        # Confirmación 5M: dirección + fuerza.
+        if d["5m"]["adx"] < ADX_MIN_5M or d["5m"]["volume_ratio"] < VOLUME_MIN_5M:
+            return
+        if direction == "LONG" and d["5m"]["plus_di"] <= d["5m"]["minus_di"]:
+            return
+        if direction == "SHORT" and d["5m"]["minus_di"] <= d["5m"]["plus_di"]:
             return
 
-        zona_min, zona_max, nivel = zona
-        precio = data["5m"]["precio"]
-        atr_value = data["4h"]["atr"]
+        zone = find_entry_zone(d, direction)
+        if not zone:
+            return
+        plan = make_plan(symbol, d, direction, score, zone)
+        if not plan:
+            return
+        plan["motives"] = motives[:6]
 
-        if not atr_value:
+        price = current_entry_price(symbol)
+        if price is None:
             return
 
-        cerca = esta_cerca(precio, zona_min, zona_max, atr_value)
-
-        if not cerca:
+        zmin, zmax = plan["entry_min"], plan["entry_max"]
+        a = d["4h"]["atr"] or d["1h"]["atr"]
+        distance = min(abs(price - zmin), abs(price - zmax)) if not (zmin <= price <= zmax) else 0
+        if not (zmin <= price <= zmax) and distance > a * PREALERT_ATR:
             return
 
-        if not hay_momentum_minimo(data):
-            print(symbol, "cerca de zona pero sin momentum suficiente.")
+        # Prealert: preparar Binance, pero todavía no entrar.
+        if not (zmin <= price <= zmax):
+            key = symbol
+            now = time.time()
+            with state_lock:
+                previous = state["prealerts"].get(key, 0)
+                if now - previous >= PREALERT_TTL_SECONDS:
+                    state["prealerts"][key] = now
+                    save_state()
+                    send_prealert(plan, price)
             return
 
-        with señales_lock:
-            señal_actual = señales_activas.get(symbol)
-
-        debe_enviar = (not señal_actual) or (señal_actual.get("direccion") != direccion)
-
-        if not debe_enviar:
-            return
-
-        with señales_lock:
-            cantidad_activas = len(señales_activas)
-
-        if cantidad_activas >= MAX_SEÑALES_SIMULTANEAS:
-            print(symbol, "descartado: ya hay", cantidad_activas, "señales activas")
-            return
-
-        resultado = mandar_orden_compra(symbol, data, direccion, score, motivos, zona)
-
-        if not resultado:
-            return
-
-        precio_entrada, stop, tp1, tp2, funding, valoracion, emoji, dejar_correr = resultado
-
-        with señales_lock:
-            señales_activas[symbol] = {
-                "direccion": direccion,
-                "timestamp": time.time(),
-                "precio_entrada": precio_entrada,
-                "stop": stop,
-                "tp1": tp1,
-                "tp2": tp2,
-                "funding": funding,
-                "valoracion": valoracion,
-                "emoji": emoji,
-                "dejar_correr": dejar_correr,
-                "estado": "esperando_tp1"
-            }
-
-        guardar_estado()
-
-    except Exception as e:
-        print("Error procesando", symbol, ":", e)
-
-
-# ============================================================
-# VIGILAR SEÑALES ACTIVAS (stop / TP1 / TP2)
-# ============================================================
-
-def vigilar_señales_activas():
-
-    with señales_lock:
-        copia = {s: dict(v) for s, v in señales_activas.items() if v.get("estado")}
-
-    for symbol, señal in copia.items():
-
-        velas = obtener_velas(symbol, "5m", 1)
-
-        if not velas:
-            continue
-
-        precio_actual = velas[-1]["close"]
-
-        direccion = señal.get("direccion")
-        tp1 = señal.get("tp1")
-        tp2 = señal.get("tp2")
-        stop = señal.get("stop")
-        entrada = señal.get("precio_entrada")
-        estado = señal.get("estado")
-        funding = señal.get("funding")
-        valoracion = señal.get("valoracion", "NEUTRAL")
-        emoji = señal.get("emoji", "⚪")
-        dejar_correr = señal.get("dejar_correr", False)
-
-        if None in (tp1, tp2, stop, entrada):
-            continue
-
-        # --------------------------------------------------------
-        # 1) STOP LOSS -> se revisa primero, cierra todo lo que
-        #    quede (sea la posición completa o el remanente 50%).
-        # --------------------------------------------------------
-
-        toco_stop = (
-            (direccion == "LONG" and precio_actual <= stop)
-            or (direccion == "SHORT" and precio_actual >= stop)
-        )
-
-        if toco_stop:
-
-            perdida_pct = calcular_ganancia_pct(entrada, precio_actual, direccion)
-
-            mandar_stop_alcanzado(symbol, precio_actual, perdida_pct, valoracion, emoji, funding)
-
-            with señales_lock:
-                señales_activas.pop(symbol, None)
-
-            guardar_estado()
-            continue
-
-        # --------------------------------------------------------
-        # 2) TP1
-        # --------------------------------------------------------
-
-        alcanzo_tp1 = (
-            (direccion == "LONG" and precio_actual >= tp1)
-            or (direccion == "SHORT" and precio_actual <= tp1)
-        )
-
-        if estado == "esperando_tp1" and alcanzo_tp1:
-
-            ganancia_pct = calcular_ganancia_pct(entrada, precio_actual, direccion)
-
-            if dejar_correr:
-
-                mandar_venta_parcial(
-                    symbol, precio_actual, ganancia_pct, valoracion, funding,
-                    "Queda 50% para TP2"
-                )
-
-                with señales_lock:
-                    if symbol in señales_activas:
-                        # Movemos el stop a breakeven para proteger
-                        # el 50% restante que sigue corriendo.
-                        señales_activas[symbol]["stop"] = entrada
-                        señales_activas[symbol]["estado"] = "esperando_tp2"
-
-                guardar_estado()
-
-            else:
-
-                mandar_venta_total(
-                    symbol, precio_actual, ganancia_pct, valoracion, emoji, funding,
-                    "Objetivo cumplido TP1"
-                )
-
-                with señales_lock:
-                    señales_activas.pop(symbol, None)
-
-                guardar_estado()
-
-            continue
-
-        # --------------------------------------------------------
-        # 3) TP2 (solo si se dejó correr después de TP1)
-        # --------------------------------------------------------
-
-        alcanzo_tp2 = (
-            (direccion == "LONG" and precio_actual >= tp2)
-            or (direccion == "SHORT" and precio_actual <= tp2)
-        )
-
-        if estado == "esperando_tp2" and alcanzo_tp2:
-
-            ganancia_pct = calcular_ganancia_pct(entrada, precio_actual, direccion)
-
-            mandar_venta_total(
-                symbol, precio_actual, ganancia_pct, valoracion, emoji, funding,
-                "Objetivo TP2 cumplido"
-            )
-
-            with señales_lock:
-                señales_activas.pop(symbol, None)
-
-            guardar_estado()
-
-
-# ============================================================
-# REPORTE DIARIO (9:30)
-# ============================================================
-
-HORA_REPORTE_DIARIO = 9
-MINUTO_REPORTE_DIARIO = 30
-
-
-def reporte_diario_estado():
-
-    ya_enviado_hoy = False
-
-    while True:
-
-        ahora = datetime.datetime.now()
-
-        if ahora.hour == HORA_REPORTE_DIARIO and ahora.minute == MINUTO_REPORTE_DIARIO:
-
-            if not ya_enviado_hoy:
-
-                enviar_telegram(
-                    "✅ TU BOT ESTÁ FUNCIONANDO\n\n"
-                    "🤖 Bot de futuros activo.\n"
-                    "📊 Escaneando el mercado.\n"
-                    "🟢 LONG / 🔴 SHORT\n"
-                    "⏰ Control diario 09:30."
-                )
-
-                ya_enviado_hoy = True
-
-        else:
-            ya_enviado_hoy = False
-
-        time.sleep(30)
-
-
-# ============================================================
-# LIMPIAR SEÑALES ANTIGUAS
-# ============================================================
-
-def limpiar_señales():
-
-    ahora = time.time()
-    hubo_cambios = False
-
-    with señales_lock:
-        borrar = [
-            s for s, señal in señales_activas.items()
-            if ahora - señal.get("timestamp", ahora) > 21600
-            and señal.get("estado") is None
-        ]
-        for s in borrar:
-            del señales_activas[s]
-            hubo_cambios = True
-
-    if hubo_cambios:
-        guardar_estado()
-
-
-# ============================================================
-# BOT PRINCIPAL
-# ============================================================
-
-def ejecutar_bot():
-
-    print("====================================")
-    print(" BOT FUTUROS CRYPTO INICIADO")
-    print("====================================")
-
-    cargar_estado()
-
-    enviar_telegram(
-        "🤖 BOT FUTUROS ONLINE\n\n"
-        "Sistema de análisis activado.\n\n"
-        "📊 50 monedas dinámicas\n"
-        "🟢 LONG\n🔴 SHORT\n\n"
-        "⏱️ 1D / 4H / 1H / 15M / 5M\n\n"
-        "💵 Valoración por Funding Rate:\n"
-        f"< {UMBRAL_FUNDING_INFRA}% = Infravalorada\n"
-        f"> {UMBRAL_FUNDING_SOBRE}% = Sobrevalorada\n\n"
-        "🛡️ Filtro sobrecompra:\n"
-        "RSI 1H > 75 = DESCARTAR\n"
-        "Stoch RSI 1H > 85 = DESCARTAR\n\n"
-        "👤 Operaciones manuales."
-    )
-
-    monedas = []
-    ultima_seleccion = 0
-
-    while True:
-
-        try:
-            ahora = time.time()
-
-            if not monedas or ahora - ultima_seleccion > 21600:
-
-                nuevas = seleccionar_monedas()
-
-                if nuevas:
-                    monedas = nuevas
-                    ultima_seleccion = ahora
-                    print("Universo actualizado:", len(monedas))
-
-            if not monedas:
-                print("No hay monedas disponibles.")
-                time.sleep(60)
+        # Confirmación final: precio ya está en zona.
+        plan["status"] = "PENDING"
+        plan["created_at"] = time.time()
+        plan["expires_at"] = plan["created_at"] + SIGNAL_TTL_SECONDS
+        if send_final_signal(plan, price):
+            with state_lock:
+                state["pending"][symbol] = plan
+            save_state()
+            logger.info("SEÑAL %s %s score=%s precio=%s", direction, symbol, score, price)
+    except Exception as exc:
+        logger.exception("Error procesando %s: %s", symbol, exc)
+
+
+# ------------------------- LIVE MONITOR ----------------------
+def monitor_pending():
+    while not stop_event.is_set():
+        now = time.time()
+        changed = False
+        with state_lock:
+            pending_items = list(state["pending"].items())
+            trades = list(state["virtual_trades"].items())
+
+        for symbol, plan in pending_items:
+            price = live_price(symbol)
+            if price is None:
+                continue
+            if now > float(plan.get("expires_at", now)):
+                with state_lock:
+                    state["pending"].pop(symbol, None)
+                send_expired(plan, "La ventana de entrada venció")
+                changed = True
                 continue
 
-            print("--------------------------------")
-            print("Nuevo ciclo:", len(monedas), "monedas")
-            print("--------------------------------")
+            zmin, zmax = float(plan["entry_min"]), float(plan["entry_max"])
+            if zmin <= price <= zmax and not plan.get("entered_alert_sent"):
+                with state_lock:
+                    if symbol in state["pending"]:
+                        state["pending"][symbol]["entered_alert_sent"] = True
+                send_entry_touched(plan, price)
+                changed = True
 
-            for symbol in monedas:
-                print("Analizando:", symbol)
-                procesar_moneda(symbol)
-                time.sleep(PAUSA_ENTRE_MONEDAS_CICLO)
+            # Si se aleja demasiado después de la señal, cancelar antes del vencimiento.
+            a = max(abs(plan["entry_max"] - plan["entry_min"]), 1e-12)
+            if plan["direction"] == "LONG" and price > zmax + a * 2.0:
+                with state_lock:
+                    state["pending"].pop(symbol, None)
+                send_expired(plan, "El precio se escapó por arriba de la zona")
+                changed = True
+            elif plan["direction"] == "SHORT" and price < zmin - a * 2.0:
+                with state_lock:
+                    state["pending"].pop(symbol, None)
+                send_expired(plan, "El precio se escapó por debajo de la zona")
+                changed = True
 
-            vigilar_señales_activas()
-            limpiar_señales()
+        for symbol, trade in trades:
+            price = live_price(symbol)
+            if price is None:
+                continue
+            d = trade["direction"]
+            stop = trade["stop"]
+            tp1 = trade["tp1"]
+            tp2 = trade["tp2"]
+            status = trade.get("status", "TP1_WAIT")
+            if (d == "LONG" and price <= stop) or (d == "SHORT" and price >= stop):
+                send_virtual_exit(trade, price, "STOP LOSS")
+                with state_lock:
+                    state["virtual_trades"].pop(symbol, None)
+                changed = True
+                continue
+            if status == "TP1_WAIT" and ((d == "LONG" and price >= tp1) or (d == "SHORT" and price <= tp1)):
+                if trade.get("aligned_funding"):
+                    send_virtual_exit(trade, price, "TP1 alcanzado — tomar 50% y proteger el resto")
+                    with state_lock:
+                        if symbol in state["virtual_trades"]:
+                            state["virtual_trades"][symbol]["status"] = "TP2_WAIT"
+                            state["virtual_trades"][symbol]["stop"] = trade["entry_price_real"] or trade["entry"]
+                else:
+                    send_virtual_exit(trade, price, "TP1 alcanzado — salida total")
+                    with state_lock:
+                        state["virtual_trades"].pop(symbol, None)
+                changed = True
+                continue
+            if status == "TP2_WAIT" and ((d == "LONG" and price >= tp2) or (d == "SHORT" and price <= tp2)):
+                send_virtual_exit(trade, price, "TP2 alcanzado")
+                with state_lock:
+                    state["virtual_trades"].pop(symbol, None)
+                changed = True
 
-            print("Ciclo terminado. Esperando", INTERVALO_ANALISIS, "segundos.")
-            time.sleep(INTERVALO_ANALISIS)
-
-        except Exception as e:
-            print("Error general:", e)
-            time.sleep(30)
+        if changed:
+            save_state()
+        stop_event.wait(1.0)
 
 
-# ============================================================
-# RUTAS WEB
-# ============================================================
+# ------------------------- ANALYSIS LOOP ---------------------
+def analysis_loop():
+    global universe
+    while not stop_event.is_set():
+        try:
+            now = time.time()
+            if not universe or now - state.get("last_universe", 0) >= UNIVERSE_REFRESH_SECONDS:
+                new_universe = select_universe()
+                if new_universe:
+                    universe = new_universe
+                    with state_lock:
+                        state["last_universe"] = now
+                    save_state()
+                    # Reiniciar WS para suscribir el nuevo universo.
+                    ws_restart_event.set()
+                    with market_lock:
+                        for s in list(live_market):
+                            if s not in universe:
+                                live_market.pop(s, None)
+
+            if universe:
+                for symbol in list(universe):
+                    if stop_event.is_set():
+                        break
+                    process_symbol(symbol)
+                    time.sleep(0.12)
+                with state_lock:
+                    state["last_analysis"] = time.time()
+                save_state()
+            stop_event.wait(ANALYSIS_INTERVAL)
+        except Exception as exc:
+            logger.exception("Error en ciclo principal: %s", exc)
+            stop_event.wait(20)
+
+
+# ------------------------- REPORTING -------------------------
+def daily_report_loop():
+    last_day = None
+    while not stop_event.is_set():
+        now = datetime.now()
+        key = now.strftime("%Y-%m-%d")
+        if now.hour == 9 and now.minute == 30 and last_day != key:
+            with state_lock:
+                pending = len(state["pending"])
+                trades = len(state["virtual_trades"])
+            with market_lock:
+                live_count = sum(1 for x in live_market.values() if time.time() - x.get("last_event", 0) < 10)
+            with state_lock:
+                ws_ok = state["ws_connected"]
+            send_telegram(
+                "✅ BOT FUTUROS PRO — CONTROL DIARIO\n\n"
+                f"WS mercado: {'🟢' if ws_ok else '🔴'}\n"
+                f"Precios vivos recientes: {live_count}\n"
+                f"Señales pendientes: {pending}\n"
+                f"Trades virtuales: {trades}\n"
+                "👤 Operación manual: el bot no ejecuta órdenes."
+            )
+            last_day = key
+        stop_event.wait(20)
+
+
+# ------------------------- WEB -------------------------------
+def authorized():
+    return bool(ADMIN_TOKEN) and request.args.get("token") == ADMIN_TOKEN
+
 
 @app.route("/")
-def inicio():
-    return "BOT FUTUROS CONFLUENCIAS ONLINE"
+def root():
+    return "BOT FUTUROS PRO ONLINE"
+
+
+@app.route("/health")
+def health():
+    with state_lock:
+        ws_ok = bool(state["ws_connected"])
+        last_analysis = state["last_analysis"]
+    return jsonify({
+        "status": "ok",
+        "ws_connected": ws_ok,
+        "universe_size": len(universe),
+        "last_analysis": utc_iso(last_analysis) if last_analysis else None,
+        "uptime_seconds": int(time.time() - state.get("started_at", time.time())),
+    })
+
+
+@app.route("/estado")
+def status():
+    if not authorized():
+        return "No autorizado", 403
+    with state_lock:
+        safe = {
+            "pending": state["pending"],
+            "virtual_trades": state["virtual_trades"],
+            "last_analysis": utc_iso(state["last_analysis"]) if state["last_analysis"] else None,
+            "last_universe": utc_iso(state["last_universe"]) if state["last_universe"] else None,
+            "ws_connected": state["ws_connected"],
+        }
+    with error_lock:
+        safe["consecutive_binance_errors"] = consecutive_binance_errors
+        safe["last_binance_error"] = last_binance_error
+    return jsonify(safe)
 
 
 @app.route("/test")
 def test():
-    if not ADMIN_TOKEN or request.args.get("token") != ADMIN_TOKEN:
+    if not authorized():
         return "No autorizado", 403
-    enviar_telegram("🟢 TEST TELEGRAM\n\nEl bot está conectado correctamente.")
-    return "TEST TELEGRAM ENVIADO"
+    ok = send_telegram("🟢 TEST BOT FUTUROS PRO\n\nTelegram conectado correctamente.")
+    return ("TEST ENVIADO" if ok else "FALLO TELEGRAM"), (200 if ok else 500)
 
 
-@app.route("/estado")
-def estado():
-    if not ADMIN_TOKEN or request.args.get("token") != ADMIN_TOKEN:
+@app.route("/senal/<symbol>")
+def signal_detail(symbol):
+    if not authorized():
         return "No autorizado", 403
-
-    with _lock_errores:
-        errores = _errores_consecutivos
-        ultimo_codigo = _ultimo_codigo_error
-
-    return {
-        "errores_consecutivos_binance": errores,
-        "ultimo_codigo_error": ultimo_codigo,
-        "señales_activas": señales_activas
-    }
+    symbol = symbol.upper()
+    with state_lock:
+        p = state["pending"].get(symbol)
+        t = state["virtual_trades"].get(symbol)
+    with market_lock:
+        live = live_snapshot(symbol)
+    return jsonify({"symbol": symbol, "live": live, "pending": p, "virtual_trade": t})
 
 
-# ============================================================
-# INICIAR
-# ============================================================
+# ------------------------- MANUAL CONFIRMATION --------------
+# El bot no puede saber si realmente compraste en Binance sin API privada.
+# Para que el seguimiento virtual use tu precio real, se puede llamar:
+# /confirmar?token=...&symbol=BTCUSDT&price=12345
+@app.route("/confirmar")
+def confirm():
+    if not authorized():
+        return "No autorizado", 403
+    symbol = request.args.get("symbol", "").upper()
+    try:
+        price = float(request.args.get("price", ""))
+    except ValueError:
+        return "Precio inválido", 400
+    with state_lock:
+        plan = state["pending"].pop(symbol, None)
+        if not plan:
+            return "No hay señal pendiente para ese símbolo", 404
+        plan["entered"] = True
+        plan["entry_price_real"] = price
+        plan["status"] = "TP1_WAIT"
+        plan["confirmed_at"] = time.time()
+        state["virtual_trades"][symbol] = plan
+    save_state()
+    send_telegram(f"🟢 ENTRADA CONFIRMADA {symbol}\nPrecio manual: {fmt_price(symbol, price)}\nEl bot inicia seguimiento virtual de SL/TP.")
+    return "Entrada confirmada"
+
+
+@app.route("/cancelar")
+def cancel_signal():
+    if not authorized():
+        return "No autorizado", 403
+    symbol = request.args.get("symbol", "").upper()
+    with state_lock:
+        plan = state["pending"].pop(symbol, None)
+    if not plan:
+        return "No hay señal pendiente", 404
+    save_state()
+    send_telegram(f"⚪ SEÑAL CANCELADA MANUALMENTE {symbol}")
+    return "Cancelada"
+
+
+# ------------------------- START / STOP ----------------------
+def start_workers():
+    global ws_thread, analysis_thread, monitor_thread
+    load_state()
+    send_telegram(
+        "🤖 BOT FUTUROS PRO ONLINE\n\n"
+        "📡 Precio en vivo: WebSocket Binance\n"
+        "📊 Análisis: 1D / 4H / 1H / 15M / 5M\n"
+        "🧠 Señales confirmadas con velas CERRADAS\n"
+        f"⏱️ Caducidad señal final: {SIGNAL_TTL_SECONDS//60} min\n"
+        f"🎯 RR mínimo TP1: {MIN_RR_TP1:.1f} | TP2: {MIN_RR_TP2:.1f}\n"
+        "👤 Órdenes manuales — el bot NO compra."
+    )
+
+    ws_thread = threading.Thread(target=websocket_loop, name="binance-ws", daemon=True)
+    monitor_thread = threading.Thread(target=monitor_pending, name="live-monitor", daemon=True)
+    analysis_thread = threading.Thread(target=analysis_loop, name="analysis", daemon=True)
+    report_thread = threading.Thread(target=daily_report_loop, name="daily-report", daemon=True)
+
+    ws_thread.start()
+    monitor_thread.start()
+    analysis_thread.start()
+    report_thread.start()
+
+
+def shutdown(*_args):
+    logger.info("Apagando bot...")
+    stop_event.set()
+
+
+os_signal.signal(os_signal.SIGTERM, shutdown)
+os_signal.signal(os_signal.SIGINT, shutdown)
 
 if __name__ == "__main__":
-
-    hilo_bot = threading.Thread(target=ejecutar_bot, daemon=True)
-    hilo_bot.start()
-
-    hilo_reporte = threading.Thread(target=reporte_diario_estado, daemon=True)
-    hilo_reporte.start()
-
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    start_workers()
+    port = int(os.getenv("PORT", "10000"))
+    # Para Render/Gunicorn, main:app es el entrypoint. El worker se inicia al importar.
+    # En ejecución directa también funciona con Flask.
+    app.run(host="0.0.0.0", port=port, debug=False)
