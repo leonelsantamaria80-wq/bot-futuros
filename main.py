@@ -16,7 +16,7 @@ from flask import Flask, jsonify, request
 import websocket
 
 # ============================================================
-# BOT DE FUTUROS PRO - SEÑALES MANUALES (v3)
+# BOT DE FUTUROS PRO - SEÑALES MANUALES (v4)
 # ============================================================
 # Binance USDⓈ-M Futures -> análisis + precio en vivo -> Telegram.
 # NO coloca órdenes en Binance.
@@ -55,9 +55,9 @@ STATE_FILE = os.path.join(BASE_DIR, "estado_bot.json")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
 
 TOTAL_MONEDAS = int(os.getenv("TOTAL_MONEDAS", "50"))
-MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "20000000"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "8"))
-MIN_SCORE_GRADE_A = int(os.getenv("MIN_SCORE_GRADE_A", "9"))
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "300000000"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "7"))
+MIN_SCORE_GRADE_A = int(os.getenv("MIN_SCORE_GRADE_A", "8"))
 MAX_SIGNAL_SLOTS = int(os.getenv("MAX_SIGNAL_SLOTS", "5"))
 
 # Exposición total = señales pendientes + trades virtuales en seguimiento.
@@ -74,17 +74,19 @@ ANALYSIS_INTERVAL = int(os.getenv("ANALYSIS_INTERVAL", "180"))
 UNIVERSE_REFRESH_SECONDS = int(os.getenv("UNIVERSE_REFRESH_SECONDS", "21600"))
 
 # Entrada: el precio debe estar dentro de la zona.
-ENTRY_ATR_WIDTH = float(os.getenv("ENTRY_ATR_WIDTH", "0.22"))
+ENTRY_ATR_WIDTH = float(os.getenv("ENTRY_ATR_WIDTH", "0.35"))
 PREALERT_ATR = float(os.getenv("PREALERT_ATR", "1.00"))
 ENTRY_MAX_CHASE_ATR = float(os.getenv("ENTRY_MAX_CHASE_ATR", "0.35"))
+DEBUG_REJECTIONS = os.getenv("DEBUG_REJECTIONS", "true").lower() in ("1", "true", "yes", "on")
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1800"))
 
 # Riesgo.
-MAX_STOP_PCT = float(os.getenv("MAX_STOP_PCT", "2.50"))
-MIN_RR_TP1 = float(os.getenv("MIN_RR_TP1", "1.50"))
-MIN_RR_TP2 = float(os.getenv("MIN_RR_TP2", "2.00"))
-MIN_NET_TP2 = float(os.getenv("MIN_NET_TP2", "1.50"))
-MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", "5"))
-MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "10"))
+SL_PCT = float(os.getenv("SL_PCT", "1.0"))
+TP1_PCT = float(os.getenv("TP1_PCT", "1.5"))
+TP2_PCT = float(os.getenv("TP2_PCT", "3.0"))
+TP3_PCT = float(os.getenv("TP3_PCT", "5.0"))
+MIN_LEVERAGE = 5
+MAX_LEVERAGE = 5
 
 # Comisión aproximada por lado (% del notional). Ajustar a la cuenta real.
 TAKER_FEE_PCT_PER_SIDE = float(os.getenv("TAKER_FEE_PCT_PER_SIDE", "0.04"))
@@ -122,7 +124,7 @@ if not logger.handlers:
         pass
 
 session = requests.Session()
-session.headers.update({"User-Agent": "futures-signal-bot-pro/3.0"})
+session.headers.update({"User-Agent": "futures-signal-bot-pro/4.0"})
 
 # ------------------------- ESTADO ----------------------------
 state_lock = threading.RLock()
@@ -841,76 +843,48 @@ def current_entry_price(symbol):
 
 
 def make_plan(symbol, d, direction, score, zone):
+    """Construye el plan de señal. NO ejecuta órdenes."""
     zone_min, zone_max, center = zone
-    entry = center
-    a = d["1h"]["atr"]
-    a4 = d["4h"]["atr"]
-    if not a or not a4:
+    entry = float(center)
+    if entry <= 0:
         return None
 
     if direction == "LONG":
-        structural = min(zone_min, d["1h"]["support"])
-        stop = structural - a * 0.15
-        tp1 = entry + a * 1.8
-        tp2 = entry + a * 3.0
+        stop = entry * (1.0 - SL_PCT / 100.0)
+        tp1 = entry * (1.0 + TP1_PCT / 100.0)
+        tp2 = entry * (1.0 + TP2_PCT / 100.0)
+        tp3 = entry * (1.0 + TP3_PCT / 100.0)
     else:
-        structural = max(zone_max, d["1h"]["resistance"])
-        stop = structural + a * 0.15
-        tp1 = entry - a * 1.8
-        tp2 = entry - a * 3.0
+        stop = entry * (1.0 + SL_PCT / 100.0)
+        tp1 = entry * (1.0 - TP1_PCT / 100.0)
+        tp2 = entry * (1.0 - TP2_PCT / 100.0)
+        tp3 = entry * (1.0 - TP3_PCT / 100.0)
 
-    stop_pct = abs(entry - stop) / entry * 100
-    if stop_pct <= 0 or stop_pct > MAX_STOP_PCT:
-        return None
+    risk_pct = SL_PCT
+    rr1 = TP1_PCT / risk_pct
+    rr2 = TP2_PCT / risk_pct
+    rr3 = TP3_PCT / risk_pct
+    lev = 5
 
-    risk = abs(entry - stop)
-    rr1 = abs(tp1 - entry) / risk
-    rr2 = abs(tp2 - entry) / risk
-    if rr1 < MIN_RR_TP1 or rr2 < MIN_RR_TP2:
-        return None
-
-    lev = risk_leverage(score, d["1h"]["adx"], d["1h"]["atr_pct"])
-    move2 = abs(tp2 - entry) / entry * 100
-    gross = move2 * lev
-    fees = TAKER_FEE_PCT_PER_SIDE * 2
-    net = gross - fees
-    if net < MIN_NET_TP2:
-        return None
-
-    funding, = (d["futures"].get("funding"),)
+    funding = d["futures"].get("funding")
     valuation, emoji = funding_class(funding)
     aligned = (direction == "LONG" and valuation == "INFRAVALORADA") or (direction == "SHORT" and valuation == "SOBREVALORADA")
 
     return {
-        "symbol": symbol,
-        "direction": direction,
-        "score": score,
+        "symbol": symbol, "direction": direction, "score": score,
         "grade": "A" if score >= MIN_SCORE_GRADE_A else "B",
-        "entry_min": zone_min,
-        "entry_max": zone_max,
-        "entry": entry,
-        "stop": stop,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr1": rr1,
-        "rr2": rr2,
-        "stop_pct": stop_pct,
-        "leverage": lev,
-        "move_tp2_pct": move2,
-        "net_tp2_pct": net,
-        "funding": funding,
-        "valuation": valuation,
-        "emoji": emoji,
-        "aligned_funding": aligned,
-        "motives": [],
-        "created_at": time.time(),
-        "expires_at": time.time() + SIGNAL_TTL_SECONDS,
-        "status": "PENDING",
-        "prealert_sent": False,
-        "entered": False,
+        "entry_min": zone_min, "entry_max": zone_max, "entry": entry,
+        "stop": stop, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "rr1": rr1, "rr2": rr2, "rr3": rr3,
+        "stop_pct": SL_PCT, "leverage": lev,
+        "move_tp1_pct": TP1_PCT, "move_tp2_pct": TP2_PCT, "move_tp3_pct": TP3_PCT,
+        "net_tp2_pct": TP2_PCT * lev - (TAKER_FEE_PCT_PER_SIDE * 2),
+        "funding": funding, "valuation": valuation, "emoji": emoji,
+        "aligned_funding": aligned, "motives": [],
+        "created_at": time.time(), "expires_at": time.time() + SIGNAL_TTL_SECONDS,
+        "status": "PENDING", "prealert_sent": False, "entered": False,
         "entry_price_real": None,
     }
-
 
 def round_price(symbol, price):
     tick = symbol_filters.get(symbol)
@@ -944,28 +918,29 @@ def send_prealert(plan, price):
 
 
 def send_final_signal(plan, price):
-    s, d = plan["symbol"], plan["direction"]
-    title = "🟢 ENTRADA LONG" if d == "LONG" else "🔴 ENTRADA SHORT"
+    s, direction = plan["symbol"], plan["direction"]
+    title = "🟢 SEÑAL DE COMPRA LONG" if direction == "LONG" else "🔴 SEÑAL DE VENTA SHORT"
     funding = "N/D" if plan["funding"] is None else f"{plan['funding']:.3f}%"
     valid = max(0, int(plan["expires_at"] - time.time()))
     msg = (
         f"{title} {s} | GRADO {plan['grade']}\n\n"
         f"💵 Precio vivo: {fmt_price(s, price)}\n"
-        f"📍 LIMIT sugerida: {fmt_price(s, plan['entry_min'])} – {fmt_price(s, plan['entry_max'])}\n"
-        f"🛑 STOP: {fmt_price(s, plan['stop'])}\n"
-        f"🎯 TP1: {fmt_price(s, plan['tp1'])}\n"
-        f"🎯 TP2: {fmt_price(s, plan['tp2'])}\n\n"
-        f"📊 Score: {plan['score']} | R:R TP1 {plan['rr1']:.2f} | TP2 {plan['rr2']:.2f}\n"
-        f"⚙️ Apalancamiento máximo sugerido: {plan['leverage']}x\n"
-        f"💰 Movimiento TP2: +{plan['move_tp2_pct']:.2f}% | estimado neto con 2 taker: +{plan['net_tp2_pct']:.2f}%\n"
+        f"📍 ZONA LIMIT: {fmt_price(s, plan['entry_min'])} – {fmt_price(s, plan['entry_max'])}\n"
+        f"🎯 Entrada guía: {fmt_price(s, plan['entry'])}\n\n"
+        f"🛑 SL: {fmt_price(s, plan['stop'])}  (-{SL_PCT:.2f}% spot / aprox. -{SL_PCT*5:.2f}% con 5x)\n"
+        f"🎯 TP1: {fmt_price(s, plan['tp1'])}  (+{TP1_PCT:.2f}% spot / +{TP1_PCT*5:.2f}% con 5x)\n"
+        f"🎯 TP2: {fmt_price(s, plan['tp2'])}  (+{TP2_PCT:.2f}% spot / +{TP2_PCT*5:.2f}% con 5x)\n"
+        f"🎯 TP3: {fmt_price(s, plan['tp3'])}  (+{TP3_PCT:.2f}% spot / +{TP3_PCT*5:.2f}% con 5x)\n\n"
+        f"📊 Score: {plan['score']} | R:R 1={plan['rr1']:.1f} | 2={plan['rr2']:.1f} | 3={plan['rr3']:.1f}\n"
+        f"⚙️ Estrategia: S × 5 | Aislado | margen sugerido: 50 USDT\n"
+        f"💰 Exposición aproximada: 250 USDT\n"
         f"{plan['emoji']} Funding: {funding} ({plan['valuation']})\n\n"
         f"⏱️ SEÑAL VÁLIDA {valid//60}m {valid%60:02d}s\n"
-        f"⚠️ Si el precio sale de la zona o vence el tiempo: NO ENTRAR.\n"
-        f"👤 Orden MANUAL. El bot NO compra.\n\n"
-        f"Tocá 'Confirmar' recién DESPUÉS de haber cargado la orden en Binance:"
+        f"⚠️ No entrar si la señal vence o el precio se escapa de la zona.\n"
+        f"👤 EJECUCIÓN MANUAL — el bot NO coloca órdenes en Binance.\n\n"
+        f"Motivos: {', '.join(plan.get('motives', [])[:6])}"
     )
     return send_telegram(msg, reply_markup=confirm_keyboard(s))
-
 
 def send_expired(plan, reason="Tiempo agotado"):
     s = plan["symbol"]
@@ -1014,7 +989,7 @@ def do_confirm(symbol, price):
     send_telegram(
         f"🟢 ENTRADA CONFIRMADA {symbol}\n"
         f"Precio: {fmt_price(symbol, price)}\n"
-        f"El bot inicia seguimiento virtual de SL/TP."
+        f"Seguimiento VIRTUAL iniciado. El bot NO ejecutó ninguna orden en Binance."
     )
     return True, f"Entrada confirmada a {fmt_price(symbol, price)}"
 
@@ -1031,88 +1006,118 @@ def do_cancel(symbol):
 
 
 # ------------------------- PROCESS ---------------------------
+def reject(symbol, reason):
+    if DEBUG_REJECTIONS:
+        logger.info("RECHAZADA %s | %s", symbol, reason)
+
+
 def process_symbol(symbol):
     try:
-        # No gastar llamadas REST si ya hay una señal/trade de este símbolo,
-        # ni si ya estamos en el tope de señales pendientes o de exposición total.
         with state_lock:
             if symbol in state["pending"] or symbol in state["virtual_trades"]:
+                reject(symbol, "ya tiene señal/trade en seguimiento")
                 return
             if len(state["pending"]) >= MAX_SIGNAL_SLOTS:
+                reject(symbol, "MAX_SIGNAL_SLOTS alcanzado")
                 return
-            total_exposure = len(state["pending"]) + len(state["virtual_trades"])
-            if total_exposure >= MAX_TOTAL_EXPOSURE:
+            if len(state["pending"]) + len(state["virtual_trades"]) >= MAX_TOTAL_EXPOSURE:
+                reject(symbol, "MAX_TOTAL_EXPOSURE alcanzado")
                 return
 
         d = build_analysis(symbol)
         if not d:
+            reject(symbol, "faltan velas/datos")
             return
 
         direction, score, motives = confluence(d)
-        if not direction or score < MIN_SCORE:
+        if not direction:
+            reject(symbol, f"sin confluencia suficiente (score={score})")
+            return
+        if score < MIN_SCORE:
+            reject(symbol, f"score {score} < mínimo {MIN_SCORE}")
             return
 
-        # Evitar perseguir precio con 1H extremo.
-        r1 = d["1h"]["rsi"]
-        sr1 = d["1h"]["stoch_rsi"]
+        r1, sr1 = d["1h"]["rsi"], d["1h"]["stoch_rsi"]
         if direction == "LONG" and (r1 > RSI_OVERBOUGHT or sr1 > 90):
+            reject(symbol, f"LONG sobreextendido RSI={r1:.1f} StochRSI={sr1:.1f}")
             return
         if direction == "SHORT" and (r1 < RSI_OVERSOLD or sr1 < 10):
+            reject(symbol, f"SHORT sobreextendido RSI={r1:.1f} StochRSI={sr1:.1f}")
             return
 
-        # Confirmación 5M: dirección + fuerza.
-        if d["5m"]["adx"] < ADX_MIN_5M or d["5m"]["volume_ratio"] < VOLUME_MIN_5M:
+        if d["5m"]["adx"] < ADX_MIN_5M:
+            reject(symbol, f"ADX 5M {d['5m']['adx']:.1f} < {ADX_MIN_5M}")
+            return
+        if d["5m"]["volume_ratio"] < VOLUME_MIN_5M:
+            reject(symbol, f"volumen 5M {d['5m']['volume_ratio']:.2f}x < {VOLUME_MIN_5M}x")
             return
         if direction == "LONG" and d["5m"]["plus_di"] <= d["5m"]["minus_di"]:
+            reject(symbol, "5M no confirma dirección LONG (+DI <= -DI)")
             return
         if direction == "SHORT" and d["5m"]["minus_di"] <= d["5m"]["plus_di"]:
+            reject(symbol, "5M no confirma dirección SHORT (-DI <= +DI)")
             return
 
         zone = find_entry_zone(d, direction)
         if not zone:
+            reject(symbol, "no se encontró zona técnica de entrada")
             return
+
         plan = make_plan(symbol, d, direction, score, zone)
         if not plan:
+            reject(symbol, "no se pudo construir plan")
             return
         plan["motives"] = motives[:6]
 
         price = current_entry_price(symbol)
         if price is None:
+            reject(symbol, "sin precio WebSocket")
             return
 
         zmin, zmax = plan["entry_min"], plan["entry_max"]
         a = d["4h"]["atr"] or d["1h"]["atr"]
-        distance = min(abs(price - zmin), abs(price - zmax)) if not (zmin <= price <= zmax) else 0
-        if not (zmin <= price <= zmax) and distance > a * PREALERT_ATR:
+        if not a:
+            reject(symbol, "ATR inválido")
+            return
+        inside = zmin <= price <= zmax
+        distance = min(abs(price-zmin), abs(price-zmax)) if not inside else 0
+        if not inside and distance > a * PREALERT_ATR:
+            reject(symbol, f"precio lejos de zona ({distance/a:.2f} ATR)")
             return
 
-        # Prealert: preparar Binance, pero todavía no entrar.
-        if not (zmin <= price <= zmax):
-            key = symbol
+        if not inside:
             now = time.time()
             with state_lock:
-                previous = state["prealerts"].get(key, 0)
+                previous = state["prealerts"].get(symbol, 0)
                 if now - previous >= PREALERT_TTL_SECONDS:
-                    state["prealerts"][key] = now
+                    state["prealerts"][symbol] = now
                     save_state()
                     send_prealert(plan, price)
+                    logger.info("PREALERTA %s %s score=%s precio=%s zona=%s-%s", direction, symbol, score, price, zmin, zmax)
             return
 
-        # Confirmación final: precio ya está en zona. Revalidar exposición
-        # total por si cambió mientras se armaba el análisis.
         with state_lock:
-            total_exposure = len(state["pending"]) + len(state["virtual_trades"])
-            if total_exposure >= MAX_TOTAL_EXPOSURE:
+            if len(state["pending"]) + len(state["virtual_trades"]) >= MAX_TOTAL_EXPOSURE:
+                reject(symbol, "exposición máxima alcanzada al final del análisis")
                 return
 
         plan["status"] = "PENDING"
         plan["created_at"] = time.time()
         plan["expires_at"] = plan["created_at"] + SIGNAL_TTL_SECONDS
+
+        # Anti-spam: no repetir la misma señal continuamente.
+        with state_lock:
+            last_sent = state["prealerts"].get(f"final:{symbol}", 0)
+        if time.time() - last_sent < SIGNAL_COOLDOWN_SECONDS:
+            reject(symbol, "cooldown de señal")
+            return
+
         if send_final_signal(plan, price):
             with state_lock:
                 state["pending"][symbol] = plan
+                state["prealerts"][f"final:{symbol}"] = time.time()
             save_state()
-            logger.info("SEÑAL %s %s score=%s precio=%s", direction, symbol, score, price)
+            logger.info("🚨 SEÑAL FINAL %s %s score=%s precio=%s zona=%s-%s", direction, symbol, score, price, zmin, zmax)
     except Exception as exc:
         logger.exception("Error procesando %s: %s", symbol, exc)
 
@@ -1312,6 +1317,25 @@ def status():
     return jsonify(safe)
 
 
+@app.route("/diagnostico")
+def diagnostico():
+    if not authorized():
+        return "No autorizado", 403
+    with state_lock:
+        return jsonify({
+            "config": {
+                "MIN_VOLUME_24H": MIN_VOLUME_24H, "MIN_SCORE": MIN_SCORE,
+                "ENTRY_ATR_WIDTH": ENTRY_ATR_WIDTH, "ADX_MIN_5M": ADX_MIN_5M,
+                "VOLUME_MIN_5M": VOLUME_MIN_5M, "SL_PCT": SL_PCT,
+                "TP1_PCT": TP1_PCT, "TP2_PCT": TP2_PCT, "TP3_PCT": TP3_PCT,
+                "leverage": 5, "execution": "MANUAL_ONLY"
+            },
+            "universe": universe,
+            "pending": list(state["pending"].keys()),
+            "virtual_trades": list(state["virtual_trades"].keys()),
+        })
+
+
 @app.route("/test")
 def test():
     if not authorized():
@@ -1425,6 +1449,8 @@ def setup_webhook():
 # ------------------------- START / STOP ----------------------
 def start_workers():
     global ws_thread, analysis_thread, monitor_thread
+    if ws_thread and ws_thread.is_alive():
+        return
     load_state()
     send_telegram(
         "🤖 BOT FUTUROS PRO ONLINE (v3)\n\n"
@@ -1432,11 +1458,11 @@ def start_workers():
         "📊 Análisis: 1D / 4H / 1H / 15M / 5M\n"
         "🧠 Señales confirmadas con velas CERRADAS\n"
         f"⏱️ Caducidad señal final: {SIGNAL_TTL_SECONDS//60} min\n"
-        f"🎯 RR mínimo TP1: {MIN_RR_TP1:.1f} | TP2: {MIN_RR_TP2:.1f}\n"
+        f"🎯 SL {SL_PCT:.1f}% | TP1 {TP1_PCT:.1f}% | TP2 {TP2_PCT:.1f}% | TP3 {TP3_PCT:.1f}%\n"
         f"📦 Exposición máxima simultánea: {MAX_TOTAL_EXPOSURE}\n"
         "🔔 Ahora avisa si Binance falla o bloquea la IP.\n"
         "✅ Confirmar/cancelar con botones en el mensaje de Telegram.\n"
-        "👤 Órdenes manuales — el bot NO compra."
+        "👤 SOLO SEÑALES: el bot NO ejecuta órdenes."
     )
 
     ws_thread = threading.Thread(target=websocket_loop, name="binance-ws", daemon=True)
@@ -1458,9 +1484,10 @@ def shutdown(*_args):
 os_signal.signal(os_signal.SIGTERM, shutdown)
 os_signal.signal(os_signal.SIGINT, shutdown)
 
+# Render/Gunicorn importa main:app, por lo que los workers deben arrancar también
+# al importar el módulo. El guard evita arrancarlos dos veces en ejecución directa.
+start_workers()
+
 if __name__ == "__main__":
-    start_workers()
     port = int(os.getenv("PORT", "10000"))
-    # Para Render/Gunicorn, main:app es el entrypoint. El worker se inicia al importar.
-    # En ejecución directa también funciona con Flask.
     app.run(host="0.0.0.0", port=port, debug=False)
