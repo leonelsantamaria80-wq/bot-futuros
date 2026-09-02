@@ -7,7 +7,6 @@ import threading
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlencode
 
@@ -55,21 +54,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "estado_bot.json")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
 
-TOTAL_MONEDAS = 15
-TOP_SCAN_SYMBOLS = 100
-CALM_SYMBOLS = 7
-VOLATILE_SYMBOLS = 8
-SCAN_KLINES_LIMIT = 70
-SCAN_KLINE_SLEEP = 0.35
-SCAN_CACHE_SECONDS = 21600
-ARG_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
-MAX_TRADES_PER_DAY = 4
-MAX_OPEN_POSITIONS = 2
-MIN_HOURS_BETWEEN_TRADES = 4.0
-MARGIN_USDT = 30.0
-LEVERAGE = 5
-REST_MIN_INTERVAL = 0.15
-MIN_VOLUME_24H = 300_000_000.0
+TOTAL_MONEDAS = int(os.getenv("TOTAL_MONEDAS", "50"))
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "300000000"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "7"))
 MIN_SCORE_GRADE_A = int(os.getenv("MIN_SCORE_GRADE_A", "8"))
 MAX_SIGNAL_SLOTS = int(os.getenv("MAX_SIGNAL_SLOTS", "5"))
@@ -84,8 +70,8 @@ SIGNAL_TTL_SECONDS = int(os.getenv("SIGNAL_TTL_SECONDS", "240"))  # 4 min
 PREALERT_TTL_SECONDS = int(os.getenv("PREALERT_TTL_SECONDS", "900"))
 
 # Motor de análisis normal.
-ANALYSIS_INTERVAL = int(os.getenv("ANALYSIS_INTERVAL", "60"))
-UNIVERSE_REFRESH_SECONDS = SCAN_CACHE_SECONDS
+ANALYSIS_INTERVAL = int(os.getenv("ANALYSIS_INTERVAL", "180"))
+UNIVERSE_REFRESH_SECONDS = int(os.getenv("UNIVERSE_REFRESH_SECONDS", "21600"))
 
 # Entrada: el precio debe estar dentro de la zona.
 ENTRY_ATR_WIDTH = float(os.getenv("ENTRY_ATR_WIDTH", "0.35"))
@@ -95,10 +81,10 @@ DEBUG_REJECTIONS = os.getenv("DEBUG_REJECTIONS", "true").lower() in ("1", "true"
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1800"))
 
 # Riesgo.
-SL_PCT = 1.0
-TP1_PCT = 1.5
-TP2_PCT = 3.0
-TP3_PCT = 5.0
+SL_PCT = float(os.getenv("SL_PCT", "1.0"))
+TP1_PCT = float(os.getenv("TP1_PCT", "1.5"))
+TP2_PCT = float(os.getenv("TP2_PCT", "3.0"))
+TP3_PCT = float(os.getenv("TP3_PCT", "5.0"))
 MIN_LEVERAGE = 5
 MAX_LEVERAGE = 5
 
@@ -148,11 +134,6 @@ state = {
     "prealerts": {},
     "last_analysis": 0,
     "last_universe": 0,
-    "last_scan": 0,
-    "trading_day": "",
-    "trades_today": 0,
-    "last_trade_at": 0,
-    "used_windows": [],
     "ws_connected": False,
     "started_at": time.time(),
 }
@@ -173,11 +154,6 @@ consecutive_binance_errors = 0
 last_binance_error = None
 last_error_alert = 0.0
 last_blocked_alert = 0.0
-binance_block_until = 0.0
-last_rest_request_at = 0.0
-rest_lock = threading.Lock()
-scan_cache = []
-last_scan = 0.0
 
 
 def utc_iso(ts=None):
@@ -297,42 +273,11 @@ def maybe_alert_binance_down(blocked=False, status_code=None):
 
 
 # ------------------------- BINANCE REST ----------------------
-def _set_binance_backoff(seconds, status_code):
-    global binance_block_until
-    seconds = max(1, int(seconds))
-    until = time.time() + seconds
-    with error_lock:
-        binance_block_until = max(binance_block_until, until)
-    logger.warning("Binance %s: pausando REST durante %ss", status_code, seconds)
-
-
-def _retry_after_seconds(response, default=60):
-    value = response.headers.get("Retry-After")
-    try:
-        return max(1, int(float(value)))
-    except (TypeError, ValueError):
-        return default
-
-
-def binance_get(endpoint, params=None, retries=2):
-    global consecutive_binance_errors, last_binance_error, last_rest_request_at
-
+def binance_get(endpoint, params=None, retries=3):
+    global consecutive_binance_errors, last_binance_error
     for attempt in range(retries):
-        with error_lock:
-            blocked_until = binance_block_until
-        wait_global = blocked_until - time.time()
-        if wait_global > 0:
-            logger.warning("REST Binance pausado por rate limit: %.0fs restantes", wait_global)
-            return None
-
         try:
-            with rest_lock:
-                gap = REST_MIN_INTERVAL - (time.time() - last_rest_request_at)
-                if gap > 0:
-                    time.sleep(gap)
-                last_rest_request_at = time.time()
-                r = session.get(BINANCE_URL + endpoint, params=params, timeout=12)
-
+            r = session.get(BINANCE_URL + endpoint, params=params, timeout=10)
             if r.status_code == 200:
                 with error_lock:
                     consecutive_binance_errors = 0
@@ -340,21 +285,23 @@ def binance_get(endpoint, params=None, retries=2):
                 return r.json()
 
             if r.status_code == 451:
+                # Bloqueo geográfico/IP: reintentar es inútil, avisar ya.
                 with error_lock:
                     consecutive_binance_errors += 1
                     last_binance_error = 451
-                logger.error("Binance 451 en %s", endpoint)
+                logger.error("Binance 451 (bloqueo regional) en %s", endpoint)
                 maybe_alert_binance_down(blocked=True, status_code=451)
                 return None
 
             if r.status_code in (418, 429):
-                wait = _retry_after_seconds(r, 120 if r.status_code == 418 else 30)
-                with error_lock:
-                    consecutive_binance_errors += 1
-                    last_binance_error = r.status_code
-                _set_binance_backoff(wait, r.status_code)
-                maybe_alert_binance_down()
-                return None
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    wait = max(2, min(int(retry_after), 60))
+                except (TypeError, ValueError):
+                    wait = min(2 ** attempt, 30)
+                logger.warning("Rate limit Binance %s; esperando %ss", r.status_code, wait)
+                time.sleep(wait)
+                continue
 
             with error_lock:
                 consecutive_binance_errors += 1
@@ -362,12 +309,9 @@ def binance_get(endpoint, params=None, retries=2):
             logger.error("Binance REST %s %s: %s", r.status_code, endpoint, r.text[:250])
             maybe_alert_binance_down()
             return None
-
         except Exception as exc:
             logger.warning("Binance REST intento %d/%d: %s", attempt + 1, retries, exc)
-            if attempt + 1 < retries:
-                time.sleep(min(2 ** attempt, 8))
-
+            time.sleep(min(2 ** attempt, 8))
     with error_lock:
         consecutive_binance_errors += 1
         last_binance_error = "NETWORK"
@@ -436,6 +380,7 @@ def get_klines(symbol, interval, limit=150, closed_only=True):
 
 def get_futures_context(symbol):
     premium = binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+    oi = binance_get("/fapi/v1/openInterest", {"symbol": symbol})
     funding = None
     mark = None
     if premium:
@@ -444,7 +389,13 @@ def get_futures_context(symbol):
             funding = float(premium.get("lastFundingRate")) * 100.0
         except Exception:
             pass
-    return {"mark": mark, "funding": funding, "open_interest": None}
+    open_interest = None
+    if oi:
+        try:
+            open_interest = float(oi.get("openInterest"))
+        except Exception:
+            pass
+    return {"mark": mark, "funding": funding, "open_interest": open_interest}
 
 
 # ------------------------- INDICADORES -----------------------
@@ -733,122 +684,41 @@ def websocket_loop():
 
 # ------------------------- UNIVERSO --------------------------
 def select_universe():
-    """Escaneo 6h: TOP 100 por volumen, filtro >=300M, ATR% 4H y 7+8."""
-    global scan_cache, last_scan
-    now = time.time()
-    if scan_cache and now - last_scan < SCAN_CACHE_SECONDS:
-        return list(scan_cache)
-
     contracts = get_exchange_info()
     volumes = get_24h_volumes()
-    if not contracts or not volumes:
-        logger.warning("No se pudo obtener universo base de Binance.")
-        return list(scan_cache)
-
-    liquid = [(s, volumes.get(s, 0.0)) for s in contracts if volumes.get(s, 0.0) >= MIN_VOLUME_24H]
-    liquid.sort(key=lambda x: x[1], reverse=True)
-    top = liquid[:TOP_SCAN_SYMBOLS]
-    logger.info("SCAN: TOP %d por volumen; %d cumplen volumen >= %.0f USDT", TOP_SCAN_SYMBOLS, len(top), MIN_VOLUME_24H)
-
     candidates = []
-    for idx, (symbol, vol) in enumerate(top, 1):
-        candles = get_klines(symbol, "4h", SCAN_KLINES_LIMIT, closed_only=True)
+    for symbol in contracts:
+        vol = volumes.get(symbol, 0)
+        if vol < MIN_VOLUME_24H:
+            continue
+        candles = get_klines(symbol, "4h", 70, closed_only=True)
         if not candles:
             continue
-        a = atr(candles, 14)
+        a = atr(candles)
         price = candles[-1]["close"]
         if not a or price <= 0:
             continue
-        atr_pct = a / price * 100.0
-        candidates.append((symbol, atr_pct, vol))
-        # Separación obligatoria del escaneo para no golpear REST.
-        time.sleep(SCAN_KLINE_SLEEP)
+        volat = a / price * 100
+        candidates.append((symbol, volat, vol))
+        time.sleep(0.08)
 
     if not candidates:
-        logger.warning("SCAN sin candidatos válidos; se conserva universo anterior.")
-        return list(scan_cache)
+        return []
 
     candidates.sort(key=lambda x: x[1])
-    calm = candidates[:CALM_SYMBOLS]
-    volatile = sorted(candidates, key=lambda x: x[1], reverse=True)[:VOLATILE_SYMBOLS]
-    combined = calm + volatile
+    calm = candidates[: max(10, TOTAL_MONEDAS - 10)]
+    liquid_volatile = sorted([x for x in candidates if x[2] >= 40_000_000], key=lambda x: x[1], reverse=True)[:10]
+    combined = calm + liquid_volatile
     result = []
     seen = set()
-    for symbol, atr_pct, vol in combined:
-        if symbol not in seen:
-            seen.add(symbol)
-            result.append(symbol)
-
-    result = result[:TOTAL_MONEDAS]
-    scan_cache = result
-    last_scan = time.time()
-    with state_lock:
-        state["last_scan"] = last_scan
-        state["last_universe"] = last_scan
-    save_state()
-    logger.info("UNIVERSO FINAL: %d símbolos | calm=%d volatile=%d", len(result), len([x for x in result if x in {s for s,_,_ in calm}]), len(result) - len([x for x in result if x in {s for s,_,_ in calm}]))
-    return list(result)
-
-
-def arg_now():
-    return datetime.now(ARG_TZ)
-
-
-def current_arg_window():
-    h = arg_now().hour
-    start = (h // 6) * 6
-    end = start + 6
-    return start, end
-
-
-def arg_window_key():
-    now = arg_now()
-    start, end = current_arg_window()
-    return f"{now.strftime('%Y-%m-%d')} {start:02d}:00-{end:02d}:00 ARG"
-
-
-def reset_trading_day_if_needed():
-    today = arg_now().strftime('%Y-%m-%d')
-    with state_lock:
-        if state.get("trading_day") != today:
-            state["trading_day"] = today
-            state["trades_today"] = 0
-            state["last_trade_at"] = 0
-            state["used_windows"] = []
-            save_state()
-
-
-def trade_gate_reason():
-    reset_trading_day_if_needed()
-    with state_lock:
-        if state["trades_today"] >= MAX_TRADES_PER_DAY:
-            return f"máximo diario alcanzado ({MAX_TRADES_PER_DAY})"
-        if len(state["virtual_trades"]) >= MAX_OPEN_POSITIONS:
-            return f"máximo de posiciones abiertas ({MAX_OPEN_POSITIONS})"
-        last_trade = float(state.get("last_trade_at") or 0)
-        if last_trade and time.time() - last_trade < MIN_HOURS_BETWEEN_TRADES * 3600:
-            remaining = MIN_HOURS_BETWEEN_TRADES - (time.time() - last_trade) / 3600
-            return f"faltan {remaining:.1f}h para el intervalo mínimo"
-        if arg_window_key() in state.get("used_windows", []):
-            return "ya hubo un trade confirmado en esta ventana ARG"
-    return None
-
-
-def register_confirmed_trade():
-    reset_trading_day_if_needed()
-    window = arg_window_key()
-    with state_lock:
-        if window in state.get("used_windows", []):
-            return False
-        if state["trades_today"] >= MAX_TRADES_PER_DAY:
-            return False
-        if len(state["virtual_trades"]) > MAX_OPEN_POSITIONS:
-            return False
-        state["trades_today"] += 1
-        state["last_trade_at"] = time.time()
-        state.setdefault("used_windows", []).append(window)
-    save_state()
-    return True
+    for s, _, _ in combined:
+        if s not in seen:
+            seen.add(s)
+            result.append(s)
+        if len(result) >= TOTAL_MONEDAS:
+            break
+    logger.info("Universo actualizado: %d símbolos", len(result))
+    return result
 
 
 # ------------------------- SIGNAL ENGINE ---------------------
@@ -863,7 +733,18 @@ def funding_class(funding):
 
 
 def risk_leverage(score, adx1h, vol_pct):
-    return LEVERAGE
+    # Nunca aumenta leverage solo porque el mercado esté más volátil.
+    # Volatilidad alta reduce leverage.
+    lev = 5
+    if score >= 9 and adx1h >= 25:
+        lev = 6
+    if score >= 10 and adx1h >= 30 and vol_pct < 1.8:
+        lev = 7
+    if score >= 11 and adx1h >= 32 and vol_pct < 1.4:
+        lev = 8
+    if score >= 12 and adx1h >= 35 and vol_pct < 1.0:
+        lev = 9
+    return max(MIN_LEVERAGE, min(MAX_LEVERAGE, lev))
 
 
 def confluence(d):
@@ -983,7 +864,7 @@ def make_plan(symbol, d, direction, score, zone):
     rr1 = TP1_PCT / risk_pct
     rr2 = TP2_PCT / risk_pct
     rr3 = TP3_PCT / risk_pct
-    lev = LEVERAGE
+    lev = 5
 
     funding = d["futures"].get("funding")
     valuation, emoji = funding_class(funding)
@@ -1051,8 +932,8 @@ def send_final_signal(plan, price):
         f"🎯 TP2: {fmt_price(s, plan['tp2'])}  (+{TP2_PCT:.2f}% spot / +{TP2_PCT*5:.2f}% con 5x)\n"
         f"🎯 TP3: {fmt_price(s, plan['tp3'])}  (+{TP3_PCT:.2f}% spot / +{TP3_PCT*5:.2f}% con 5x)\n\n"
         f"📊 Score: {plan['score']} | R:R 1={plan['rr1']:.1f} | 2={plan['rr2']:.1f} | 3={plan['rr3']:.1f}\n"
-        f"⚙️ Estrategia: S × 5 | Aislado | margen sugerido: 30 USDT\n"
-        f"💰 Exposición aproximada: {MARGIN_USDT * LEVERAGE:.0f} USDT\n"
+        f"⚙️ Estrategia: S × 5 | Aislado | margen sugerido: 50 USDT\n"
+        f"💰 Exposición aproximada: 250 USDT\n"
         f"{plan['emoji']} Funding: {funding} ({plan['valuation']})\n\n"
         f"⏱️ SEÑAL VÁLIDA {valid//60}m {valid%60:02d}s\n"
         f"⚠️ No entrar si la señal vence o el precio se escapa de la zona.\n"
@@ -1095,26 +976,15 @@ def send_virtual_exit(trade, price, reason):
 # y los botones de Telegram (webhook), para no duplicar código.
 def do_confirm(symbol, price):
     symbol = symbol.upper()
-    gate = trade_gate_reason()
-    if gate:
-        return False, f"No se puede confirmar: {gate}"
     with state_lock:
-        plan = state["pending"].get(symbol)
+        plan = state["pending"].pop(symbol, None)
         if not plan:
             return False, "No hay señal pendiente para ese símbolo"
-        if len(state["virtual_trades"]) >= MAX_OPEN_POSITIONS:
-            return False, f"Máximo de posiciones abiertas: {MAX_OPEN_POSITIONS}"
         plan["entered"] = True
         plan["entry_price_real"] = price
         plan["status"] = "TP1_WAIT"
         plan["confirmed_at"] = time.time()
         state["virtual_trades"][symbol] = plan
-        state["pending"].pop(symbol, None)
-    if not register_confirmed_trade():
-        with state_lock:
-            state["virtual_trades"].pop(symbol, None)
-            state["pending"][symbol] = plan
-        return False, "No se pudo registrar el trade por las reglas de límite"
     save_state()
     send_telegram(
         f"🟢 ENTRADA CONFIRMADA {symbol}\n"
@@ -1153,11 +1023,6 @@ def process_symbol(symbol):
             if len(state["pending"]) + len(state["virtual_trades"]) >= MAX_TOTAL_EXPOSURE:
                 reject(symbol, "MAX_TOTAL_EXPOSURE alcanzado")
                 return
-
-        gate = trade_gate_reason()
-        if gate:
-            reject(symbol, f"regla operativa: {gate}")
-            return
 
         d = build_analysis(symbol)
         if not d:
@@ -1340,64 +1205,43 @@ def monitor_pending():
 # ------------------------- ANALYSIS LOOP ---------------------
 def analysis_loop():
     global universe
-    last_window_checked = None
     while not stop_event.is_set():
         try:
-            reset_trading_day_if_needed()
             now = time.time()
-            window = arg_window_key()
-
-            # Escaneo TOP100 + ATR solo cada 6 horas.
-            if not universe or now - last_scan >= SCAN_CACHE_SECONDS:
-                with error_lock:
-                    blocked = binance_block_until > time.time()
-                if blocked:
-                    stop_event.wait(30)
-                    continue
+            if not universe or now - state.get("last_universe", 0) >= UNIVERSE_REFRESH_SECONDS:
                 new_universe = select_universe()
                 if new_universe:
                     universe = new_universe
                     with state_lock:
-                        state["last_universe"] = time.time()
+                        state["last_universe"] = now
                     save_state()
+                    # Reiniciar WS para suscribir el nuevo universo.
                     ws_restart_event.set()
                     with market_lock:
                         for s in list(live_market):
                             if s not in universe:
                                 live_market.pop(s, None)
 
-            # Un único análisis por ventana argentina de 6 horas.
-            if universe and window != last_window_checked:
-                last_window_checked = window
-                logger.info("ANÁLISIS VENTANA %s | universo=%s", window, universe)
-                before_pending = len(state["pending"])
+            if universe:
                 for symbol in list(universe):
                     if stop_event.is_set():
                         break
                     process_symbol(symbol)
-                    time.sleep(0.15)
-
+                    time.sleep(0.12)
                 with state_lock:
                     state["last_analysis"] = time.time()
-                    has_new_signal = len(state["pending"]) > before_pending
                 save_state()
-
-                if not has_new_signal:
-                    msg = f"⚠️ Ventana {window} sin entradas: escaneé {universe} y 0 dieron -1%. Sigo en la próxima ventana"
-                    send_telegram(msg)
-                    logger.warning(msg)
-
-            stop_event.wait(30)
+            stop_event.wait(ANALYSIS_INTERVAL)
         except Exception as exc:
             logger.exception("Error en ciclo principal: %s", exc)
-            stop_event.wait(30)
+            stop_event.wait(20)
 
 
 # ------------------------- REPORTING -------------------------
 def daily_report_loop():
     last_day = None
     while not stop_event.is_set():
-        now = arg_now()
+        now = datetime.now()
         key = now.strftime("%Y-%m-%d")
         if now.hour == 9 and now.minute == 30 and last_day != key:
             with state_lock:
@@ -1411,7 +1255,6 @@ def daily_report_loop():
                 errors = consecutive_binance_errors
                 last_err = last_binance_error
             send_telegram(
-                "🤖 Tu bot está funcionando — 09:30 ARG\n\n"
                 "✅ BOT FUTUROS PRO — CONTROL DIARIO\n\n"
                 f"WS mercado: {'🟢' if ws_ok else '🔴'}\n"
                 f"Precios vivos recientes: {live_count}\n"
@@ -1453,12 +1296,6 @@ def health():
         "max_total_exposure": MAX_TOTAL_EXPOSURE,
         "consecutive_binance_errors": errors,
         "last_binance_error": last_err,
-        "binance_rest_block_seconds": max(0, int(binance_block_until - time.time())),
-        "scan_age_seconds": max(0, int(time.time() - last_scan)) if last_scan else None,
-        "trades_today": state.get("trades_today", 0),
-        "max_trades_per_day": MAX_TRADES_PER_DAY,
-        "open_positions": len(state.get("virtual_trades", {})),
-        "max_open_positions": MAX_OPEN_POSITIONS,
     })
 
 
@@ -1473,11 +1310,6 @@ def status():
             "last_analysis": utc_iso(state["last_analysis"]) if state["last_analysis"] else None,
             "last_universe": utc_iso(state["last_universe"]) if state["last_universe"] else None,
             "ws_connected": state["ws_connected"],
-            "trading_day": state.get("trading_day"),
-            "trades_today": state.get("trades_today", 0),
-            "last_trade_at": utc_iso(state["last_trade_at"]) if state.get("last_trade_at") else None,
-            "used_windows": state.get("used_windows", []),
-            "last_scan": utc_iso(state.get("last_scan")) if state.get("last_scan") else None,
         }
     with error_lock:
         safe["consecutive_binance_errors"] = consecutive_binance_errors
@@ -1496,12 +1328,7 @@ def diagnostico():
                 "ENTRY_ATR_WIDTH": ENTRY_ATR_WIDTH, "ADX_MIN_5M": ADX_MIN_5M,
                 "VOLUME_MIN_5M": VOLUME_MIN_5M, "SL_PCT": SL_PCT,
                 "TP1_PCT": TP1_PCT, "TP2_PCT": TP2_PCT, "TP3_PCT": TP3_PCT,
-                "leverage": LEVERAGE, "margin_usdt": MARGIN_USDT,
-                "top_scan_symbols": TOP_SCAN_SYMBOLS, "final_universe": TOTAL_MONEDAS,
-                "calm_symbols": CALM_SYMBOLS, "volatile_symbols": VOLATILE_SYMBOLS,
-                "scan_cache_seconds": SCAN_CACHE_SECONDS, "scan_kline_sleep": SCAN_KLINE_SLEEP,
-                "max_trades_per_day": MAX_TRADES_PER_DAY, "max_open_positions": MAX_OPEN_POSITIONS,
-                "min_hours_between_trades": MIN_HOURS_BETWEEN_TRADES, "execution": "MANUAL_ONLY"
+                "leverage": 5, "execution": "MANUAL_ONLY"
             },
             "universe": universe,
             "pending": list(state["pending"].keys()),
@@ -1626,14 +1453,13 @@ def start_workers():
         return
     load_state()
     send_telegram(
-        "🤖 BOT FUTUROS PRO ONLINE (v4)\n\n"
+        "🤖 BOT FUTUROS PRO ONLINE (v3)\n\n"
         "📡 Precio en vivo: WebSocket Binance\n"
         "📊 Análisis: 1D / 4H / 1H / 15M / 5M\n"
         "🧠 Señales confirmadas con velas CERRADAS\n"
         f"⏱️ Caducidad señal final: {SIGNAL_TTL_SECONDS//60} min\n"
         f"🎯 SL {SL_PCT:.1f}% | TP1 {TP1_PCT:.1f}% | TP2 {TP2_PCT:.1f}% | TP3 {TP3_PCT:.1f}%\n"
-        f"📦 Universo: TOP {TOP_SCAN_SYMBOLS} → {CALM_SYMBOLS} calmadas + {VOLATILE_SYMBOLS} volátiles = {TOTAL_MONEDAS}\n"
-        f"💵 Margen: {MARGIN_USDT:.0f} USDT | Leverage: {LEVERAGE}x | Máx/día: {MAX_TRADES_PER_DAY} | Máx abiertas: {MAX_OPEN_POSITIONS}\n"
+        f"📦 Exposición máxima simultánea: {MAX_TOTAL_EXPOSURE}\n"
         "🔔 Ahora avisa si Binance falla o bloquea la IP.\n"
         "✅ Confirmar/cancelar con botones en el mensaje de Telegram.\n"
         "👤 SOLO SEÑALES: el bot NO ejecuta órdenes."
