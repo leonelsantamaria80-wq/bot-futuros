@@ -16,10 +16,19 @@ from flask import Flask, jsonify, request
 import websocket
 
 # ============================================================
-# BOT DE FUTUROS PRO - SEÑALES MANUALES
+# BOT DE FUTUROS PRO - SEÑALES MANUALES (v4)
 # ============================================================
 # Binance USDⓈ-M Futures -> análisis + precio en vivo -> Telegram.
 # NO coloca órdenes en Binance.
+#
+# Novedades v3:
+#   - Alerta por Telegram si Binance empieza a fallar en serio
+#     (errores consecutivos) o si devuelve 451 (bloqueo regional/IP).
+#   - Límite de exposición TOTAL (pendientes + trades virtuales),
+#     no solo de señales pendientes.
+#   - Confirmación / cancelación de señales con BOTONES en el
+#     mensaje de Telegram (webhook), además de los endpoints
+#     manuales /confirmar y /cancelar que ya existían.
 #
 # Diseño principal:
 #   1) REST: velas cerradas, universo, funding, OI, filtros.
@@ -38,38 +47,46 @@ BINANCE_URL = os.getenv("BINANCE_URL", "https://fapi.binance.com")
 WS_URL = os.getenv("BINANCE_WS_URL", "wss://fstream.binance.com/market/stream")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")  # opcional pero recomendado
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "estado_bot.json")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
 
-TOTAL_MONEDAS = int(os.getenv("TOTAL_MONEDAS", "20"))
-MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "30000000"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "8"))
-MIN_SCORE_GRADE_A = int(os.getenv("MIN_SCORE_GRADE_A", "9"))
+TOTAL_MONEDAS = int(os.getenv("TOTAL_MONEDAS", "50"))
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "300000000"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "7"))
+MIN_SCORE_GRADE_A = int(os.getenv("MIN_SCORE_GRADE_A", "8"))
 MAX_SIGNAL_SLOTS = int(os.getenv("MAX_SIGNAL_SLOTS", "5"))
+
+# Exposición total = señales pendientes + trades virtuales en seguimiento.
+# Antes solo se limitaban las pendientes; esto evita acumular más
+# posiciones virtuales de las que realmente podés seguir.
+MAX_TOTAL_EXPOSURE = int(os.getenv("MAX_TOTAL_EXPOSURE", "8"))
 
 # La señal final se mantiene válida durante este tiempo.
 SIGNAL_TTL_SECONDS = int(os.getenv("SIGNAL_TTL_SECONDS", "240"))  # 4 min
 PREALERT_TTL_SECONDS = int(os.getenv("PREALERT_TTL_SECONDS", "900"))
 
 # Motor de análisis normal.
-ANALYSIS_INTERVAL = int(os.getenv("ANALYSIS_INTERVAL", "600"))
-UNIVERSE_REFRESH_SECONDS = int(os.getenv("UNIVERSE_REFRESH_SECONDS", "43200"))
+ANALYSIS_INTERVAL = int(os.getenv("ANALYSIS_INTERVAL", "180"))
+UNIVERSE_REFRESH_SECONDS = int(os.getenv("UNIVERSE_REFRESH_SECONDS", "21600"))
 
 # Entrada: el precio debe estar dentro de la zona.
-ENTRY_ATR_WIDTH = float(os.getenv("ENTRY_ATR_WIDTH", "0.22"))
-PREALERT_ATR = float(os.getenv("PREALERT_ATR", "1.50"))
-ENTRY_MAX_CHASE_ATR = float(os.getenv("ENTRY_MAX_CHASE_ATR", "0.50"))
+ENTRY_ATR_WIDTH = float(os.getenv("ENTRY_ATR_WIDTH", "0.35"))
+PREALERT_ATR = float(os.getenv("PREALERT_ATR", "1.00"))
+ENTRY_MAX_CHASE_ATR = float(os.getenv("ENTRY_MAX_CHASE_ATR", "0.35"))
+DEBUG_REJECTIONS = os.getenv("DEBUG_REJECTIONS", "true").lower() in ("1", "true", "yes", "on")
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1800"))
 
 # Riesgo.
-MAX_STOP_PCT = float(os.getenv("MAX_STOP_PCT", "2.50"))
-MIN_RR_TP1 = float(os.getenv("MIN_RR_TP1", "1.50"))
-MIN_RR_TP2 = float(os.getenv("MIN_RR_TP2", "2.00"))
-MIN_NET_TP2 = float(os.getenv("MIN_NET_TP2", "1.50"))
-MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", "5"))
-MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "10"))
+SL_PCT = float(os.getenv("SL_PCT", "1.0"))
+TP1_PCT = float(os.getenv("TP1_PCT", "1.5"))
+TP2_PCT = float(os.getenv("TP2_PCT", "3.0"))
+TP3_PCT = float(os.getenv("TP3_PCT", "5.0"))
+MIN_LEVERAGE = 5
+MAX_LEVERAGE = 5
 
 # Comisión aproximada por lado (% del notional). Ajustar a la cuenta real.
 TAKER_FEE_PCT_PER_SIDE = float(os.getenv("TAKER_FEE_PCT_PER_SIDE", "0.04"))
@@ -83,6 +100,11 @@ VOLUME_MIN_5M = 0.90
 # Funding expresado en porcentaje.
 FUNDING_INFRA_PCT = -0.02
 FUNDING_SOBRE_PCT = 0.08
+
+# Alertas de salud de Binance (para no perder señales en silencio).
+ALERT_ERROR_THRESHOLD = int(os.getenv("ALERT_ERROR_THRESHOLD", "20"))
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "900"))  # 15 min entre alertas repetidas
+BLOCKED_ALERT_COOLDOWN_SECONDS = int(os.getenv("BLOCKED_ALERT_COOLDOWN_SECONDS", "60"))
 
 # ------------------------- APP / LOG -------------------------
 app = Flask(__name__)
@@ -102,7 +124,7 @@ if not logger.handlers:
         pass
 
 session = requests.Session()
-session.headers.update({"User-Agent": "futures-signal-bot-pro/2.0"})
+session.headers.update({"User-Agent": "futures-signal-bot-pro/4.0"})
 
 # ------------------------- ESTADO ----------------------------
 state_lock = threading.RLock()
@@ -132,10 +154,6 @@ consecutive_binance_errors = 0
 last_binance_error = None
 last_error_alert = 0.0
 last_blocked_alert = 0.0
-binance_block_until = 0.0
-rest_lock = threading.Lock()
-REST_MIN_INTERVAL = float(os.getenv("REST_MIN_INTERVAL", "0.35"))
-last_rest_request_at = 0.0
 
 
 def utc_iso(ts=None):
@@ -173,13 +191,16 @@ def load_state():
 
 
 # ------------------------- TELEGRAM --------------------------
-def send_telegram(text):
+def send_telegram(text, reply_markup=None):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram no configurado.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
-        r = session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=12)
+        r = session.post(url, json=payload, timeout=12)
         if r.status_code != 200:
             logger.error("Telegram %s: %s", r.status_code, r.text[:300])
             return False
@@ -189,41 +210,113 @@ def send_telegram(text):
         return False
 
 
-# ------------------------- BINANCE REST ----------------------
-def binance_get(endpoint, params=None, retries=2):
-    global consecutive_binance_errors, last_binance_error, binance_block_until, last_rest_request_at
-    for attempt in range(retries):
+def answer_callback(callback_query_id, text, show_alert=False):
+    if not TELEGRAM_TOKEN or not callback_query_id:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
+    try:
+        r = session.post(url, json={
+            "callback_query_id": callback_query_id,
+            "text": text[:200],
+            "show_alert": show_alert,
+        }, timeout=8)
+        return r.status_code == 200
+    except Exception as exc:
+        logger.warning("answerCallbackQuery error: %s", exc)
+        return False
+
+
+def confirm_keyboard(symbol):
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ Confirmar (precio actual)", "callback_data": f"confirm:{symbol}"},
+            {"text": "❌ Cancelar", "callback_data": f"cancel:{symbol}"},
+        ]]
+    }
+
+
+# ------------------------- ALERTAS DE SALUD -------------------
+def maybe_alert_binance_down(blocked=False, status_code=None):
+    """Avisa por Telegram si Binance empieza a fallar de forma sostenida,
+    o inmediatamente si detecta un bloqueo regional (451/403 tipo geo-block)."""
+    global last_error_alert, last_blocked_alert
+    now = time.time()
+    with error_lock:
+        errors = consecutive_binance_errors
+        last_err = last_binance_error
+
+    if blocked:
         with error_lock:
-            blocked_until = binance_block_until
-        if blocked_until > time.time():
-            logger.warning("REST Binance pausado por rate limit: %.0fs restantes", blocked_until-time.time())
-            return None
+            if now - last_blocked_alert < BLOCKED_ALERT_COOLDOWN_SECONDS:
+                return
+            last_blocked_alert = now
+        send_telegram(
+            "🚫 ALERTA BOT FUTUROS PRO\n\n"
+            f"Binance devolvió {status_code} (bloqueo por región/IP del servidor).\n"
+            "Reintentar no sirve: esto no se arregla solo. Hay que revisar "
+            "el hosting/proxy o el endpoint de Binance usado.\n"
+            "Mientras tanto el bot puede quedarse SIN analizar monedas."
+        )
+        return
+
+    if errors < ALERT_ERROR_THRESHOLD:
+        return
+    with error_lock:
+        if now - last_error_alert < ALERT_COOLDOWN_SECONDS:
+            return
+        last_error_alert = now
+    send_telegram(
+        "⚠️ ALERTA BOT FUTUROS PRO\n\n"
+        f"Binance viene fallando: {errors} errores seguidos (último código: {last_err}).\n"
+        "Es posible que el bot esté sin poder analizar el mercado. Revisar logs/Render."
+    )
+
+
+# ------------------------- BINANCE REST ----------------------
+def binance_get(endpoint, params=None, retries=3):
+    global consecutive_binance_errors, last_binance_error
+    for attempt in range(retries):
         try:
-            with rest_lock:
-                gap = REST_MIN_INTERVAL - (time.time()-last_rest_request_at)
-                if gap > 0: time.sleep(gap)
-                last_rest_request_at=time.time()
-                r=session.get(BINANCE_URL+endpoint,params=params,timeout=12)
-            if r.status_code==200:
-                with error_lock: consecutive_binance_errors=0; last_binance_error=None
-                return r.json()
-            if r.status_code==451:
-                with error_lock: consecutive_binance_errors+=1; last_binance_error=451
-                logger.error("Binance 451 en %s: bloqueo regional/IP",endpoint); maybe_alert_binance_down(blocked=True,status_code=451); return None
-            if r.status_code in (418,429):
-                try: server_wait=int(float(r.headers.get("Retry-After","60")))
-                except (TypeError,ValueError): server_wait=60
-                wait=max(60,min(server_wait,21600))
-                if r.status_code==418: wait=max(wait,min(21600,300*(attempt+1)))
+            r = session.get(BINANCE_URL + endpoint, params=params, timeout=10)
+            if r.status_code == 200:
                 with error_lock:
-                    binance_block_until=max(binance_block_until,time.time()+wait); consecutive_binance_errors+=1; last_binance_error=r.status_code
-                logger.warning("Binance %s: pausando REST durante %ss",r.status_code,wait); maybe_alert_binance_down(); return None
-            with error_lock: consecutive_binance_errors+=1; last_binance_error=r.status_code
-            logger.error("Binance REST %s %s: %s",r.status_code,endpoint,r.text[:250]); maybe_alert_binance_down(); return None
+                    consecutive_binance_errors = 0
+                    last_binance_error = None
+                return r.json()
+
+            if r.status_code == 451:
+                # Bloqueo geográfico/IP: reintentar es inútil, avisar ya.
+                with error_lock:
+                    consecutive_binance_errors += 1
+                    last_binance_error = 451
+                logger.error("Binance 451 (bloqueo regional) en %s", endpoint)
+                maybe_alert_binance_down(blocked=True, status_code=451)
+                return None
+
+            if r.status_code in (418, 429):
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    wait = max(2, min(int(retry_after), 60))
+                except (TypeError, ValueError):
+                    wait = min(2 ** attempt, 30)
+                logger.warning("Rate limit Binance %s; esperando %ss", r.status_code, wait)
+                time.sleep(wait)
+                continue
+
+            with error_lock:
+                consecutive_binance_errors += 1
+                last_binance_error = r.status_code
+            logger.error("Binance REST %s %s: %s", r.status_code, endpoint, r.text[:250])
+            maybe_alert_binance_down()
+            return None
         except Exception as exc:
-            logger.warning("Binance REST intento %d/%d: %s",attempt+1,retries,exc); time.sleep(min(2**attempt,8))
-    with error_lock: consecutive_binance_errors+=1; last_binance_error="NETWORK"
-    maybe_alert_binance_down(); return None
+            logger.warning("Binance REST intento %d/%d: %s", attempt + 1, retries, exc)
+            time.sleep(min(2 ** attempt, 8))
+    with error_lock:
+        consecutive_binance_errors += 1
+        last_binance_error = "NETWORK"
+    maybe_alert_binance_down()
+    return None
 
 
 def get_exchange_info():
@@ -750,76 +843,48 @@ def current_entry_price(symbol):
 
 
 def make_plan(symbol, d, direction, score, zone):
+    """Construye el plan de señal. NO ejecuta órdenes."""
     zone_min, zone_max, center = zone
-    entry = center
-    a = d["1h"]["atr"]
-    a4 = d["4h"]["atr"]
-    if not a or not a4:
+    entry = float(center)
+    if entry <= 0:
         return None
 
     if direction == "LONG":
-        structural = min(zone_min, d["1h"]["support"])
-        stop = structural - a * 0.15
-        tp1 = entry + a * 1.8
-        tp2 = entry + a * 3.0
+        stop = entry * (1.0 - SL_PCT / 100.0)
+        tp1 = entry * (1.0 + TP1_PCT / 100.0)
+        tp2 = entry * (1.0 + TP2_PCT / 100.0)
+        tp3 = entry * (1.0 + TP3_PCT / 100.0)
     else:
-        structural = max(zone_max, d["1h"]["resistance"])
-        stop = structural + a * 0.15
-        tp1 = entry - a * 1.8
-        tp2 = entry - a * 3.0
+        stop = entry * (1.0 + SL_PCT / 100.0)
+        tp1 = entry * (1.0 - TP1_PCT / 100.0)
+        tp2 = entry * (1.0 - TP2_PCT / 100.0)
+        tp3 = entry * (1.0 - TP3_PCT / 100.0)
 
-    stop_pct = abs(entry - stop) / entry * 100
-    if stop_pct <= 0 or stop_pct > MAX_STOP_PCT:
-        return None
+    risk_pct = SL_PCT
+    rr1 = TP1_PCT / risk_pct
+    rr2 = TP2_PCT / risk_pct
+    rr3 = TP3_PCT / risk_pct
+    lev = 5
 
-    risk = abs(entry - stop)
-    rr1 = abs(tp1 - entry) / risk
-    rr2 = abs(tp2 - entry) / risk
-    if rr1 < MIN_RR_TP1 or rr2 < MIN_RR_TP2:
-        return None
-
-    lev = risk_leverage(score, d["1h"]["adx"], d["1h"]["atr_pct"])
-    move2 = abs(tp2 - entry) / entry * 100
-    gross = move2 * lev
-    fees = TAKER_FEE_PCT_PER_SIDE * 2
-    net = gross - fees
-    if net < MIN_NET_TP2:
-        return None
-
-    funding, = (d["futures"].get("funding"),)
+    funding = d["futures"].get("funding")
     valuation, emoji = funding_class(funding)
     aligned = (direction == "LONG" and valuation == "INFRAVALORADA") or (direction == "SHORT" and valuation == "SOBREVALORADA")
 
     return {
-        "symbol": symbol,
-        "direction": direction,
-        "score": score,
+        "symbol": symbol, "direction": direction, "score": score,
         "grade": "A" if score >= MIN_SCORE_GRADE_A else "B",
-        "entry_min": zone_min,
-        "entry_max": zone_max,
-        "entry": entry,
-        "stop": stop,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr1": rr1,
-        "rr2": rr2,
-        "stop_pct": stop_pct,
-        "leverage": lev,
-        "move_tp2_pct": move2,
-        "net_tp2_pct": net,
-        "funding": funding,
-        "valuation": valuation,
-        "emoji": emoji,
-        "aligned_funding": aligned,
-        "motives": [],
-        "created_at": time.time(),
-        "expires_at": time.time() + SIGNAL_TTL_SECONDS,
-        "status": "PENDING",
-        "prealert_sent": False,
-        "entered": False,
+        "entry_min": zone_min, "entry_max": zone_max, "entry": entry,
+        "stop": stop, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "rr1": rr1, "rr2": rr2, "rr3": rr3,
+        "stop_pct": SL_PCT, "leverage": lev,
+        "move_tp1_pct": TP1_PCT, "move_tp2_pct": TP2_PCT, "move_tp3_pct": TP3_PCT,
+        "net_tp2_pct": TP2_PCT * lev - (TAKER_FEE_PCT_PER_SIDE * 2),
+        "funding": funding, "valuation": valuation, "emoji": emoji,
+        "aligned_funding": aligned, "motives": [],
+        "created_at": time.time(), "expires_at": time.time() + SIGNAL_TTL_SECONDS,
+        "status": "PENDING", "prealert_sent": False, "entered": False,
         "entry_price_real": None,
     }
-
 
 def round_price(symbol, price):
     tick = symbol_filters.get(symbol)
@@ -853,27 +918,29 @@ def send_prealert(plan, price):
 
 
 def send_final_signal(plan, price):
-    s, d = plan["symbol"], plan["direction"]
-    title = (("🟢 SEÑAL ANTICIPADA LONG" if d == "LONG" else "🔴 SEÑAL ANTICIPADA SHORT") if plan.get("advance_signal") else ("🟢 ENTRADA LONG" if d == "LONG" else "🔴 ENTRADA SHORT"))
+    s, direction = plan["symbol"], plan["direction"]
+    title = "🟢 SEÑAL DE COMPRA LONG" if direction == "LONG" else "🔴 SEÑAL DE VENTA SHORT"
     funding = "N/D" if plan["funding"] is None else f"{plan['funding']:.3f}%"
     valid = max(0, int(plan["expires_at"] - time.time()))
     msg = (
         f"{title} {s} | GRADO {plan['grade']}\n\n"
         f"💵 Precio vivo: {fmt_price(s, price)}\n"
-        f"📍 LIMIT sugerida: {fmt_price(s, plan['entry_min'])} – {fmt_price(s, plan['entry_max'])}\n"
-        f"🛑 STOP: {fmt_price(s, plan['stop'])}\n"
-        f"🎯 TP1: {fmt_price(s, plan['tp1'])}\n"
-        f"🎯 TP2: {fmt_price(s, plan['tp2'])}\n\n"
-        f"📊 Score: {plan['score']} | R:R TP1 {plan['rr1']:.2f} | TP2 {plan['rr2']:.2f}\n"
-        f"⚙️ Apalancamiento máximo sugerido: {plan['leverage']}x\n"
-        f"💰 Movimiento TP2: +{plan['move_tp2_pct']:.2f}% | estimado neto con 2 taker: +{plan['net_tp2_pct']:.2f}%\n"
+        f"📍 ZONA LIMIT: {fmt_price(s, plan['entry_min'])} – {fmt_price(s, plan['entry_max'])}\n"
+        f"🎯 Entrada guía: {fmt_price(s, plan['entry'])}\n\n"
+        f"🛑 SL: {fmt_price(s, plan['stop'])}  (-{SL_PCT:.2f}% spot / aprox. -{SL_PCT*5:.2f}% con 5x)\n"
+        f"🎯 TP1: {fmt_price(s, plan['tp1'])}  (+{TP1_PCT:.2f}% spot / +{TP1_PCT*5:.2f}% con 5x)\n"
+        f"🎯 TP2: {fmt_price(s, plan['tp2'])}  (+{TP2_PCT:.2f}% spot / +{TP2_PCT*5:.2f}% con 5x)\n"
+        f"🎯 TP3: {fmt_price(s, plan['tp3'])}  (+{TP3_PCT:.2f}% spot / +{TP3_PCT*5:.2f}% con 5x)\n\n"
+        f"📊 Score: {plan['score']} | R:R 1={plan['rr1']:.1f} | 2={plan['rr2']:.1f} | 3={plan['rr3']:.1f}\n"
+        f"⚙️ Estrategia: S × 5 | Aislado | margen sugerido: 50 USDT\n"
+        f"💰 Exposición aproximada: 250 USDT\n"
         f"{plan['emoji']} Funding: {funding} ({plan['valuation']})\n\n"
-        f"⏱️ VÁLIDA {valid//60}m {valid%60:02d}s\n"
-        f"⚠️ Cargar LIMIT solo dentro de la zona. No perseguir el precio.\n"
-        f"👤 Orden MANUAL. El bot NO compra."
+        f"⏱️ SEÑAL VÁLIDA {valid//60}m {valid%60:02d}s\n"
+        f"⚠️ No entrar si la señal vence o el precio se escapa de la zona.\n"
+        f"👤 EJECUCIÓN MANUAL — el bot NO coloca órdenes en Binance.\n\n"
+        f"Motivos: {', '.join(plan.get('motives', [])[:6])}"
     )
-    return send_telegram(msg)
-
+    return send_telegram(msg, reply_markup=confirm_keyboard(s))
 
 def send_expired(plan, reason="Tiempo agotado"):
     s = plan["symbol"]
@@ -904,83 +971,153 @@ def send_virtual_exit(trade, price, reason):
     )
 
 
+# ------------------------- CONFIRMAR / CANCELAR ---------------
+# Lógica compartida entre el endpoint manual (/confirmar, /cancelar)
+# y los botones de Telegram (webhook), para no duplicar código.
+def do_confirm(symbol, price):
+    symbol = symbol.upper()
+    with state_lock:
+        plan = state["pending"].pop(symbol, None)
+        if not plan:
+            return False, "No hay señal pendiente para ese símbolo"
+        plan["entered"] = True
+        plan["entry_price_real"] = price
+        plan["status"] = "TP1_WAIT"
+        plan["confirmed_at"] = time.time()
+        state["virtual_trades"][symbol] = plan
+    save_state()
+    send_telegram(
+        f"🟢 ENTRADA CONFIRMADA {symbol}\n"
+        f"Precio: {fmt_price(symbol, price)}\n"
+        f"Seguimiento VIRTUAL iniciado. El bot NO ejecutó ninguna orden en Binance."
+    )
+    return True, f"Entrada confirmada a {fmt_price(symbol, price)}"
+
+
+def do_cancel(symbol):
+    symbol = symbol.upper()
+    with state_lock:
+        plan = state["pending"].pop(symbol, None)
+    if not plan:
+        return False, "No hay señal pendiente para ese símbolo"
+    save_state()
+    send_telegram(f"⚪ SEÑAL CANCELADA MANUALMENTE {symbol}")
+    return True, "Señal cancelada"
+
+
 # ------------------------- PROCESS ---------------------------
+def reject(symbol, reason):
+    if DEBUG_REJECTIONS:
+        logger.info("RECHAZADA %s | %s", symbol, reason)
+
+
 def process_symbol(symbol):
     try:
-        # No gastar llamadas REST si ya hay una señal/trade de este símbolo.
         with state_lock:
             if symbol in state["pending"] or symbol in state["virtual_trades"]:
+                reject(symbol, "ya tiene señal/trade en seguimiento")
                 return
             if len(state["pending"]) >= MAX_SIGNAL_SLOTS:
+                reject(symbol, "MAX_SIGNAL_SLOTS alcanzado")
+                return
+            if len(state["pending"]) + len(state["virtual_trades"]) >= MAX_TOTAL_EXPOSURE:
+                reject(symbol, "MAX_TOTAL_EXPOSURE alcanzado")
                 return
 
         d = build_analysis(symbol)
         if not d:
+            reject(symbol, "faltan velas/datos")
             return
 
         direction, score, motives = confluence(d)
-        if not direction or score < MIN_SCORE:
+        if not direction:
+            reject(symbol, f"sin confluencia suficiente (score={score})")
+            return
+        if score < MIN_SCORE:
+            reject(symbol, f"score {score} < mínimo {MIN_SCORE}")
             return
 
-        # Evitar perseguir precio con 1H extremo.
-        r1 = d["1h"]["rsi"]
-        sr1 = d["1h"]["stoch_rsi"]
+        r1, sr1 = d["1h"]["rsi"], d["1h"]["stoch_rsi"]
         if direction == "LONG" and (r1 > RSI_OVERBOUGHT or sr1 > 90):
+            reject(symbol, f"LONG sobreextendido RSI={r1:.1f} StochRSI={sr1:.1f}")
             return
         if direction == "SHORT" and (r1 < RSI_OVERSOLD or sr1 < 10):
+            reject(symbol, f"SHORT sobreextendido RSI={r1:.1f} StochRSI={sr1:.1f}")
             return
 
-        # Confirmación 5M: dirección + fuerza.
-        if d["5m"]["adx"] < ADX_MIN_5M or d["5m"]["volume_ratio"] < VOLUME_MIN_5M:
+        if d["5m"]["adx"] < ADX_MIN_5M:
+            reject(symbol, f"ADX 5M {d['5m']['adx']:.1f} < {ADX_MIN_5M}")
+            return
+        if d["5m"]["volume_ratio"] < VOLUME_MIN_5M:
+            reject(symbol, f"volumen 5M {d['5m']['volume_ratio']:.2f}x < {VOLUME_MIN_5M}x")
             return
         if direction == "LONG" and d["5m"]["plus_di"] <= d["5m"]["minus_di"]:
+            reject(symbol, "5M no confirma dirección LONG (+DI <= -DI)")
             return
         if direction == "SHORT" and d["5m"]["minus_di"] <= d["5m"]["plus_di"]:
+            reject(symbol, "5M no confirma dirección SHORT (-DI <= +DI)")
             return
 
         zone = find_entry_zone(d, direction)
         if not zone:
+            reject(symbol, "no se encontró zona técnica de entrada")
             return
+
         plan = make_plan(symbol, d, direction, score, zone)
         if not plan:
+            reject(symbol, "no se pudo construir plan")
             return
         plan["motives"] = motives[:6]
 
         price = current_entry_price(symbol)
         if price is None:
+            reject(symbol, "sin precio WebSocket")
             return
 
         zmin, zmax = plan["entry_min"], plan["entry_max"]
         a = d["4h"]["atr"] or d["1h"]["atr"]
-        distance = min(abs(price - zmin), abs(price - zmax)) if not (zmin <= price <= zmax) else 0
-        if not (zmin <= price <= zmax) and distance > a * PREALERT_ATR:
+        if not a:
+            reject(symbol, "ATR inválido")
+            return
+        inside = zmin <= price <= zmax
+        distance = min(abs(price-zmin), abs(price-zmax)) if not inside else 0
+        if not inside and distance > a * PREALERT_ATR:
+            reject(symbol, f"precio lejos de zona ({distance/a:.2f} ATR)")
             return
 
-        # SEÑAL ANTICIPADA: si está cerca de la zona, enviamos el plan completo
-        # para que puedas cargar la LIMIT con anticipación. No esperamos el toque.
-        if not (zmin <= price <= zmax):
-            key = symbol; now = time.time()
+        if not inside:
+            now = time.time()
             with state_lock:
-                if key in state["pending"] or now-state["prealerts"].get(key,0) < PREALERT_TTL_SECONDS: return
-                state["prealerts"][key]=now
-            plan["status"]="PENDING"; plan["advance_signal"]=True
-            plan["created_at"]=now; plan["expires_at"]=now+PREALERT_TTL_SECONDS
-            save_state()
-            if send_final_signal(plan,price):
-                with state_lock: state["pending"][symbol]=plan
-                save_state()
-                logger.info("SEÑAL ANTICIPADA %s %s score=%s precio=%s",direction,symbol,score,price)
+                previous = state["prealerts"].get(symbol, 0)
+                if now - previous >= PREALERT_TTL_SECONDS:
+                    state["prealerts"][symbol] = now
+                    save_state()
+                    send_prealert(plan, price)
+                    logger.info("PREALERTA %s %s score=%s precio=%s zona=%s-%s", direction, symbol, score, price, zmin, zmax)
             return
 
-        # Confirmación inmediata: precio ya está en zona.
+        with state_lock:
+            if len(state["pending"]) + len(state["virtual_trades"]) >= MAX_TOTAL_EXPOSURE:
+                reject(symbol, "exposición máxima alcanzada al final del análisis")
+                return
+
         plan["status"] = "PENDING"
         plan["created_at"] = time.time()
         plan["expires_at"] = plan["created_at"] + SIGNAL_TTL_SECONDS
+
+        # Anti-spam: no repetir la misma señal continuamente.
+        with state_lock:
+            last_sent = state["prealerts"].get(f"final:{symbol}", 0)
+        if time.time() - last_sent < SIGNAL_COOLDOWN_SECONDS:
+            reject(symbol, "cooldown de señal")
+            return
+
         if send_final_signal(plan, price):
             with state_lock:
                 state["pending"][symbol] = plan
+                state["prealerts"][f"final:{symbol}"] = time.time()
             save_state()
-            logger.info("SEÑAL %s %s score=%s precio=%s", direction, symbol, score, price)
+            logger.info("🚨 SEÑAL FINAL %s %s score=%s precio=%s zona=%s-%s", direction, symbol, score, price, zmin, zmax)
     except Exception as exc:
         logger.exception("Error procesando %s: %s", symbol, exc)
 
@@ -1114,12 +1251,16 @@ def daily_report_loop():
                 live_count = sum(1 for x in live_market.values() if time.time() - x.get("last_event", 0) < 10)
             with state_lock:
                 ws_ok = state["ws_connected"]
+            with error_lock:
+                errors = consecutive_binance_errors
+                last_err = last_binance_error
             send_telegram(
                 "✅ BOT FUTUROS PRO — CONTROL DIARIO\n\n"
                 f"WS mercado: {'🟢' if ws_ok else '🔴'}\n"
                 f"Precios vivos recientes: {live_count}\n"
                 f"Señales pendientes: {pending}\n"
-                f"Trades virtuales: {trades}\n"
+                f"Trades virtuales: {trades} (exposición máx: {MAX_TOTAL_EXPOSURE})\n"
+                f"Errores Binance consecutivos: {errors} (último: {last_err})\n"
                 "👤 Operación manual: el bot no ejecuta órdenes."
             )
             last_day = key
@@ -1141,12 +1282,20 @@ def health():
     with state_lock:
         ws_ok = bool(state["ws_connected"])
         last_analysis = state["last_analysis"]
+        exposure = len(state["pending"]) + len(state["virtual_trades"])
+    with error_lock:
+        errors = consecutive_binance_errors
+        last_err = last_binance_error
     return jsonify({
         "status": "ok",
         "ws_connected": ws_ok,
         "universe_size": len(universe),
         "last_analysis": utc_iso(last_analysis) if last_analysis else None,
         "uptime_seconds": int(time.time() - state.get("started_at", time.time())),
+        "total_exposure": exposure,
+        "max_total_exposure": MAX_TOTAL_EXPOSURE,
+        "consecutive_binance_errors": errors,
+        "last_binance_error": last_err,
     })
 
 
@@ -1166,6 +1315,25 @@ def status():
         safe["consecutive_binance_errors"] = consecutive_binance_errors
         safe["last_binance_error"] = last_binance_error
     return jsonify(safe)
+
+
+@app.route("/diagnostico")
+def diagnostico():
+    if not authorized():
+        return "No autorizado", 403
+    with state_lock:
+        return jsonify({
+            "config": {
+                "MIN_VOLUME_24H": MIN_VOLUME_24H, "MIN_SCORE": MIN_SCORE,
+                "ENTRY_ATR_WIDTH": ENTRY_ATR_WIDTH, "ADX_MIN_5M": ADX_MIN_5M,
+                "VOLUME_MIN_5M": VOLUME_MIN_5M, "SL_PCT": SL_PCT,
+                "TP1_PCT": TP1_PCT, "TP2_PCT": TP2_PCT, "TP3_PCT": TP3_PCT,
+                "leverage": 5, "execution": "MANUAL_ONLY"
+            },
+            "universe": universe,
+            "pending": list(state["pending"].keys()),
+            "virtual_trades": list(state["virtual_trades"].keys()),
+        })
 
 
 @app.route("/test")
@@ -1193,6 +1361,8 @@ def signal_detail(symbol):
 # El bot no puede saber si realmente compraste en Binance sin API privada.
 # Para que el seguimiento virtual use tu precio real, se puede llamar:
 # /confirmar?token=...&symbol=BTCUSDT&price=12345
+# (o, más cómodo, tocar el botón "Confirmar" en el mensaje de Telegram,
+# que usa el precio en vivo en el momento del click).
 @app.route("/confirmar")
 def confirm():
     if not authorized():
@@ -1202,18 +1372,8 @@ def confirm():
         price = float(request.args.get("price", ""))
     except ValueError:
         return "Precio inválido", 400
-    with state_lock:
-        plan = state["pending"].pop(symbol, None)
-        if not plan:
-            return "No hay señal pendiente para ese símbolo", 404
-        plan["entered"] = True
-        plan["entry_price_real"] = price
-        plan["status"] = "TP1_WAIT"
-        plan["confirmed_at"] = time.time()
-        state["virtual_trades"][symbol] = plan
-    save_state()
-    send_telegram(f"🟢 ENTRADA CONFIRMADA {symbol}\nPrecio manual: {fmt_price(symbol, price)}\nEl bot inicia seguimiento virtual de SL/TP.")
-    return "Entrada confirmada"
+    ok, msg = do_confirm(symbol, price)
+    return msg, (200 if ok else 404)
 
 
 @app.route("/cancelar")
@@ -1221,27 +1381,88 @@ def cancel_signal():
     if not authorized():
         return "No autorizado", 403
     symbol = request.args.get("symbol", "").upper()
-    with state_lock:
-        plan = state["pending"].pop(symbol, None)
-    if not plan:
-        return "No hay señal pendiente", 404
-    save_state()
-    send_telegram(f"⚪ SEÑAL CANCELADA MANUALMENTE {symbol}")
-    return "Cancelada"
+    ok, msg = do_cancel(symbol)
+    return msg, (200 if ok else 404)
+
+
+# ------------------------- TELEGRAM WEBHOOK -------------------
+# Recibe los clicks de los botones "Confirmar" / "Cancelar" que van
+# pegados al mensaje de señal. Para activarlo, una sola vez:
+#   GET /setup-webhook?token=TU_ADMIN_TOKEN
+# (usa automáticamente la URL pública de Render).
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    if TELEGRAM_WEBHOOK_SECRET:
+        header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if header != TELEGRAM_WEBHOOK_SECRET:
+            return "No autorizado", 403
+
+    update = request.get_json(silent=True) or {}
+    cq = update.get("callback_query")
+    if not cq:
+        return jsonify({"ok": True})
+
+    cq_id = cq.get("id")
+    data = cq.get("data", "")
+    try:
+        action, symbol = data.split(":", 1)
+    except ValueError:
+        answer_callback(cq_id, "Dato inválido")
+        return jsonify({"ok": True})
+
+    symbol = symbol.upper()
+
+    if action == "confirm":
+        price = live_price(symbol)
+        if price is None:
+            answer_callback(cq_id, "Sin precio en vivo ahora, usá /confirmar con precio manual", show_alert=True)
+            return jsonify({"ok": True})
+        ok, msg = do_confirm(symbol, price)
+        answer_callback(cq_id, msg, show_alert=not ok)
+    elif action == "cancel":
+        ok, msg = do_cancel(symbol)
+        answer_callback(cq_id, msg, show_alert=not ok)
+    else:
+        answer_callback(cq_id, "Acción desconocida")
+
+    return jsonify({"ok": True})
+
+
+@app.route("/setup-webhook")
+def setup_webhook():
+    if not authorized():
+        return "No autorizado", 403
+    if not TELEGRAM_TOKEN:
+        return "Falta TELEGRAM_TOKEN", 400
+    base_url = request.args.get("url") or request.url_root.rstrip("/")
+    webhook_url = base_url.rstrip("/") + "/telegram-webhook"
+    payload = {"url": webhook_url, "allowed_updates": ["callback_query"]}
+    if TELEGRAM_WEBHOOK_SECRET:
+        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+    try:
+        r = session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook", json=payload, timeout=12)
+        return jsonify(r.json())
+    except Exception as exc:
+        return f"Error: {exc}", 500
 
 
 # ------------------------- START / STOP ----------------------
 def start_workers():
     global ws_thread, analysis_thread, monitor_thread
+    if ws_thread and ws_thread.is_alive():
+        return
     load_state()
     send_telegram(
-        "🤖 BOT FUTUROS PRO ONLINE\n\n"
+        "🤖 BOT FUTUROS PRO ONLINE (v3)\n\n"
         "📡 Precio en vivo: WebSocket Binance\n"
         "📊 Análisis: 1D / 4H / 1H / 15M / 5M\n"
         "🧠 Señales confirmadas con velas CERRADAS\n"
         f"⏱️ Caducidad señal final: {SIGNAL_TTL_SECONDS//60} min\n"
-        f"🎯 RR mínimo TP1: {MIN_RR_TP1:.1f} | TP2: {MIN_RR_TP2:.1f}\n"
-        "👤 Órdenes manuales — el bot NO compra."
+        f"🎯 SL {SL_PCT:.1f}% | TP1 {TP1_PCT:.1f}% | TP2 {TP2_PCT:.1f}% | TP3 {TP3_PCT:.1f}%\n"
+        f"📦 Exposición máxima simultánea: {MAX_TOTAL_EXPOSURE}\n"
+        "🔔 Ahora avisa si Binance falla o bloquea la IP.\n"
+        "✅ Confirmar/cancelar con botones en el mensaje de Telegram.\n"
+        "👤 SOLO SEÑALES: el bot NO ejecuta órdenes."
     )
 
     ws_thread = threading.Thread(target=websocket_loop, name="binance-ws", daemon=True)
@@ -1263,9 +1484,10 @@ def shutdown(*_args):
 os_signal.signal(os_signal.SIGTERM, shutdown)
 os_signal.signal(os_signal.SIGINT, shutdown)
 
+# Render/Gunicorn importa main:app, por lo que los workers deben arrancar también
+# al importar el módulo. El guard evita arrancarlos dos veces en ejecución directa.
+start_workers()
+
 if __name__ == "__main__":
-    start_workers()
     port = int(os.getenv("PORT", "10000"))
-    # Para Render/Gunicorn, main:app es el entrypoint. El worker se inicia al importar.
-    # En ejecución directa también funciona con Flask.
     app.run(host="0.0.0.0", port=port, debug=False)
