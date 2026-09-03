@@ -16,19 +16,29 @@ from flask import Flask, jsonify, request
 import websocket
 
 # ============================================================
-# BOT DE FUTUROS PRO - SEÑALES MANUALES (v4)
+# BOT DE FUTUROS PRO - SEÑALES MANUALES (v5)
 # ============================================================
 # Binance USDⓈ-M Futures -> análisis + precio en vivo -> Telegram.
 # NO coloca órdenes en Binance.
 #
-# Novedades v3:
-#   - Alerta por Telegram si Binance empieza a fallar en serio
-#     (errores consecutivos) o si devuelve 451 (bloqueo regional/IP).
-#   - Límite de exposición TOTAL (pendientes + trades virtuales),
-#     no solo de señales pendientes.
-#   - Confirmación / cancelación de señales con BOTONES en el
-#     mensaje de Telegram (webhook), además de los endpoints
-#     manuales /confirmar y /cancelar que ya existían.
+# Novedades v5 (fix de baneos 418/429):
+#   - El bot NO reintenta a lo loco contra Binance. Ahora respeta el
+#     ban/rate-limit de forma GLOBAL: si Binance devuelve 429 o 418,
+#     se guarda un "banned_until" (persistido en disco) y TODAS las
+#     llamadas a la API se saltean hasta que pase ese tiempo. Esto es
+#     clave porque Binance escala la duración del ban para quien sigue
+#     insistiendo (de 2 minutos hasta 3 días).
+#   - select_universe() ya no golpea klines para "todas" las monedas
+#     que pasan el filtro de volumen: ordena por volumen y limita la
+#     cantidad de símbolos analizados por ciclo (MAX_UNIVERSE_CANDIDATES),
+#     además de esperar más entre pedidos.
+#   - Throttle proactivo: lee el header X-MBX-USED-WEIGHT-1M que manda
+#     Binance y si nos acercamos al límite, frena antes de que nos bloqueen.
+#   - El estado de baneo se persiste, así un reinicio en Render NO vuelve
+#     a bombardear a Binance mientras el ban sigue activo (eso empeoraba
+#     el problema: cada redeploy reiniciaba el conteo y sumaba otro strike).
+#   - Alertas por Telegram más claras cuando hay ban activo, con la hora
+#     estimada en que se levanta.
 #
 # Diseño principal:
 #   1) REST: velas cerradas, universo, funding, OI, filtros.
@@ -73,6 +83,19 @@ PREALERT_TTL_SECONDS = int(os.getenv("PREALERT_TTL_SECONDS", "900"))
 ANALYSIS_INTERVAL = int(os.getenv("ANALYSIS_INTERVAL", "180"))
 UNIVERSE_REFRESH_SECONDS = int(os.getenv("UNIVERSE_REFRESH_SECONDS", "21600"))
 
+# Cuántos símbolos como máximo se analizan con klines por ciclo de
+# selección de universo. Antes se le pegaba a TODOS los que pasaban el
+# filtro de volumen (podían ser 100-200+), eso es lo que disparaba el
+# 418. Ahora se ordena por volumen y se recorta acá.
+MAX_UNIVERSE_CANDIDATES = int(os.getenv("MAX_UNIVERSE_CANDIDATES", "120"))
+
+# Pausa entre pedidos REST sucesivos (además del backoff por rate-limit).
+REQUEST_PACING_SECONDS = float(os.getenv("REQUEST_PACING_SECONDS", "0.15"))
+
+# Peso usado (X-MBX-USED-WEIGHT-1M) a partir del cual el bot frena
+# preventivamente en vez de esperar a que Binance lo banee.
+WEIGHT_SOFT_LIMIT = int(os.getenv("WEIGHT_SOFT_LIMIT", "1800"))  # límite real: 2400/min
+
 # Entrada: el precio debe estar dentro de la zona.
 ENTRY_ATR_WIDTH = float(os.getenv("ENTRY_ATR_WIDTH", "0.35"))
 PREALERT_ATR = float(os.getenv("PREALERT_ATR", "1.00"))
@@ -105,6 +128,7 @@ FUNDING_SOBRE_PCT = 0.08
 ALERT_ERROR_THRESHOLD = int(os.getenv("ALERT_ERROR_THRESHOLD", "20"))
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "900"))  # 15 min entre alertas repetidas
 BLOCKED_ALERT_COOLDOWN_SECONDS = int(os.getenv("BLOCKED_ALERT_COOLDOWN_SECONDS", "60"))
+BAN_ALERT_COOLDOWN_SECONDS = int(os.getenv("BAN_ALERT_COOLDOWN_SECONDS", "300"))
 
 # ------------------------- APP / LOG -------------------------
 app = Flask(__name__)
@@ -124,7 +148,7 @@ if not logger.handlers:
         pass
 
 session = requests.Session()
-session.headers.update({"User-Agent": "futures-signal-bot-pro/4.0"})
+session.headers.update({"User-Agent": "futures-signal-bot-pro/5.0"})
 
 # ------------------------- ESTADO ----------------------------
 state_lock = threading.RLock()
@@ -136,6 +160,8 @@ state = {
     "last_universe": 0,
     "ws_connected": False,
     "started_at": time.time(),
+    "banned_until": 0.0,   # timestamp epoch: mientras now < esto, no se llama a Binance
+    "last_ban_reason": None,
 }
 
 market_lock = threading.RLock()
@@ -154,6 +180,8 @@ consecutive_binance_errors = 0
 last_binance_error = None
 last_error_alert = 0.0
 last_blocked_alert = 0.0
+last_ban_alert = 0.0
+last_used_weight = 0
 
 
 def utc_iso(ts=None):
@@ -186,6 +214,14 @@ def load_state():
                 if key in loaded:
                     state[key] = loaded[key]
         logger.info("Estado recuperado: %d pendientes / %d trades", len(state["pending"]), len(state["virtual_trades"]))
+        banned_until = state.get("banned_until", 0.0) or 0.0
+        if banned_until > time.time():
+            restante = int(banned_until - time.time())
+            logger.warning(
+                "Ban de Binance seguía activo al reiniciar (%s). Faltan %ds. "
+                "NO se harán pedidos a Binance hasta entonces.",
+                state.get("last_ban_reason"), restante
+            )
     except Exception as exc:
         logger.exception("Estado corrupto/no recuperable: %s", exc)
 
@@ -235,33 +271,74 @@ def confirm_keyboard(symbol):
     }
 
 
+# ------------------------- BAN / RATE LIMIT GLOBAL -------------
+# Binance banea la IP (418) cuando se sigue insistiendo después de 429s,
+# y la duración escala para reincidentes (de 2 minutos a 3 días). Por
+# eso ACÁ CENTRALIZAMOS la decisión de "puedo pedir o no": ningún otro
+# lugar del código debe reintentar por su cuenta contra un ban activo.
+def is_banned():
+    with state_lock:
+        return time.time() < float(state.get("banned_until", 0) or 0)
+
+
+def ban_remaining():
+    with state_lock:
+        return max(0.0, float(state.get("banned_until", 0) or 0) - time.time())
+
+
+def set_ban(seconds, reason):
+    seconds = max(0.0, float(seconds))
+    now = time.time()
+    with state_lock:
+        current = float(state.get("banned_until", 0) or 0)
+        new_until = now + seconds
+        # nunca acortamos un ban ya en curso, solo lo extendemos si corresponde
+        state["banned_until"] = max(current, new_until)
+        state["last_ban_reason"] = reason
+    save_state()
+    maybe_alert_ban(reason, state["banned_until"])
+
+
+def maybe_alert_ban(reason, until_ts):
+    global last_ban_alert
+    now = time.time()
+    with error_lock:
+        if now - last_ban_alert < BAN_ALERT_COOLDOWN_SECONDS:
+            return
+        last_ban_alert = now
+    restante = max(0, int(until_ts - now))
+    send_telegram(
+        "🚫 BINANCE BLOQUEÓ TEMPORALMENTE ESTA IP\n\n"
+        f"Motivo: {reason}\n"
+        f"El bot va a dejar de pedir datos a Binance por ~{restante//60}m {restante%60:02d}s "
+        "y va a reanudar solo cuando se levante el bloqueo.\n"
+        "Esto suele pasar por exceso de pedidos o porque la IP compartida del "
+        "hosting (Render) ya venía con historial. Si se repite seguido, "
+        "puede hacer falta una IP dedicada."
+    )
+
+
+def maybe_soft_throttle(used_weight):
+    """Frena preventivamente si nos acercamos al límite de peso por minuto,
+    en vez de esperar a que Binance directamente nos banee."""
+    global last_used_weight
+    last_used_weight = used_weight
+    if used_weight and used_weight >= WEIGHT_SOFT_LIMIT:
+        logger.warning("Peso usado alto en Binance (%s/2400 aprox). Frenando unos segundos.", used_weight)
+        time.sleep(3.0)
+
+
 # ------------------------- ALERTAS DE SALUD -------------------
-def maybe_alert_binance_down(blocked=False, status_code=None):
-    """Avisa por Telegram si Binance empieza a fallar de forma sostenida,
-    o inmediatamente si detecta un bloqueo regional (451/403 tipo geo-block)."""
-    global last_error_alert, last_blocked_alert
+def maybe_alert_binance_down():
+    """Avisa por Telegram si Binance empieza a fallar de forma sostenida
+    por motivos NO relacionados a rate-limit (esos ya avisan por maybe_alert_ban)."""
+    global last_error_alert
     now = time.time()
     with error_lock:
         errors = consecutive_binance_errors
         last_err = last_binance_error
-
-    if blocked:
-        with error_lock:
-            if now - last_blocked_alert < BLOCKED_ALERT_COOLDOWN_SECONDS:
-                return
-            last_blocked_alert = now
-        send_telegram(
-            "🚫 ALERTA BOT FUTUROS PRO\n\n"
-            f"Binance devolvió {status_code} (bloqueo por región/IP del servidor).\n"
-            "Reintentar no sirve: esto no se arregla solo. Hay que revisar "
-            "el hosting/proxy o el endpoint de Binance usado.\n"
-            "Mientras tanto el bot puede quedarse SIN analizar monedas."
-        )
-        return
-
-    if errors < ALERT_ERROR_THRESHOLD:
-        return
-    with error_lock:
+        if errors < ALERT_ERROR_THRESHOLD:
+            return
         if now - last_error_alert < ALERT_COOLDOWN_SECONDS:
             return
         last_error_alert = now
@@ -275,9 +352,23 @@ def maybe_alert_binance_down(blocked=False, status_code=None):
 # ------------------------- BINANCE REST ----------------------
 def binance_get(endpoint, params=None, retries=3):
     global consecutive_binance_errors, last_binance_error
+
+    if is_banned():
+        # No generamos tráfico nuevo mientras dure el ban: seguir pidiendo
+        # es exactamente lo que hace que Binance extienda el bloqueo.
+        return None
+
     for attempt in range(retries):
         try:
             r = session.get(BINANCE_URL + endpoint, params=params, timeout=10)
+
+            used_weight = r.headers.get("X-MBX-USED-WEIGHT-1M")
+            if used_weight:
+                try:
+                    maybe_soft_throttle(int(used_weight))
+                except ValueError:
+                    pass
+
             if r.status_code == 200:
                 with error_lock:
                     consecutive_binance_errors = 0
@@ -290,18 +381,25 @@ def binance_get(endpoint, params=None, retries=3):
                     consecutive_binance_errors += 1
                     last_binance_error = 451
                 logger.error("Binance 451 (bloqueo regional) en %s", endpoint)
-                maybe_alert_binance_down(blocked=True, status_code=451)
+                set_ban(BLOCKED_ALERT_COOLDOWN_SECONDS * 5, "Bloqueo geográfico/IP (451)")
                 return None
 
             if r.status_code in (418, 429):
                 retry_after = r.headers.get("Retry-After")
                 try:
-                    wait = max(2, min(int(retry_after), 60))
+                    wait = int(retry_after)
                 except (TypeError, ValueError):
-                    wait = min(2 ** attempt, 30)
-                logger.warning("Rate limit Binance %s; esperando %ss", r.status_code, wait)
-                time.sleep(wait)
-                continue
+                    wait = 60 if r.status_code == 429 else 120
+                # Un 418 es un ban confirmado por Binance: lo tomamos tal cual.
+                # Un 429 es advertencia; igual frenamos TODO el bot ese tiempo
+                # para no convertirlo en un 418.
+                with error_lock:
+                    consecutive_binance_errors += 1
+                    last_binance_error = r.status_code
+                motivo = "IP baneada por Binance (418)" if r.status_code == 418 else "Rate limit (429) de Binance"
+                logger.error("Binance %s en %s. Pausando %ss.", r.status_code, endpoint, wait)
+                set_ban(wait, motivo)
+                return None  # no seguimos reintentando: eso es lo que agrava el ban
 
             with error_lock:
                 consecutive_binance_errors += 1
@@ -684,13 +782,35 @@ def websocket_loop():
 
 # ------------------------- UNIVERSO --------------------------
 def select_universe():
+    if is_banned():
+        logger.info("select_universe: ban activo, se salta este ciclo (%ds restantes).", int(ban_remaining()))
+        return []
+
     contracts = get_exchange_info()
+    if is_banned():
+        return []
     volumes = get_24h_volumes()
-    candidates = []
+    if is_banned():
+        return []
+
+    prefiltered = []
     for symbol in contracts:
         vol = volumes.get(symbol, 0)
-        if vol < MIN_VOLUME_24H:
-            continue
+        if vol >= MIN_VOLUME_24H:
+            prefiltered.append((symbol, vol))
+
+    # Antes se le pegaba a klines por CADA símbolo que pasaba el filtro de
+    # volumen (podían ser 100-200+), lo que disparaba el rate-limit de
+    # Binance apenas arrancaba el bot. Ahora ordenamos por volumen y
+    # recortamos a MAX_UNIVERSE_CANDIDATES antes de pedir velas.
+    prefiltered.sort(key=lambda x: x[1], reverse=True)
+    prefiltered = prefiltered[:MAX_UNIVERSE_CANDIDATES]
+
+    candidates = []
+    for symbol, vol in prefiltered:
+        if is_banned():
+            logger.info("select_universe: se activó un ban a mitad de ciclo, corto acá.")
+            break
         candles = get_klines(symbol, "4h", 70, closed_only=True)
         if not candles:
             continue
@@ -700,7 +820,7 @@ def select_universe():
             continue
         volat = a / price * 100
         candidates.append((symbol, volat, vol))
-        time.sleep(0.08)
+        time.sleep(REQUEST_PACING_SECONDS)
 
     if not candidates:
         return []
@@ -717,7 +837,7 @@ def select_universe():
             result.append(s)
         if len(result) >= TOTAL_MONEDAS:
             break
-    logger.info("Universo actualizado: %d símbolos", len(result))
+    logger.info("Universo actualizado: %d símbolos (de %d candidatos por volumen)", len(result), len(prefiltered))
     return result
 
 
@@ -799,13 +919,17 @@ def confluence(d):
 
 
 def build_analysis(symbol):
+    if is_banned():
+        return None
     d = {}
     for tf in ("1d", "4h", "1h", "15m", "5m"):
+        if is_banned():
+            return None
         candles = get_klines(symbol, tf, 150, closed_only=True)
         if not candles or len(candles) < 60:
             return None
         d[tf] = analyze_tf(candles)
-        time.sleep(0.08)
+        time.sleep(REQUEST_PACING_SECONDS)
     d["futures"] = get_futures_context(symbol)
     return d
 
@@ -1013,6 +1137,8 @@ def reject(symbol, reason):
 
 def process_symbol(symbol):
     try:
+        if is_banned():
+            return
         with state_lock:
             if symbol in state["pending"] or symbol in state["virtual_trades"]:
                 reject(symbol, "ya tiene señal/trade en seguimiento")
@@ -1207,6 +1333,12 @@ def analysis_loop():
     global universe
     while not stop_event.is_set():
         try:
+            if is_banned():
+                restante = ban_remaining()
+                logger.info("analysis_loop: ban activo, esperando %ds antes de reintentar.", int(restante))
+                stop_event.wait(min(restante + 2, ANALYSIS_INTERVAL))
+                continue
+
             now = time.time()
             if not universe or now - state.get("last_universe", 0) >= UNIVERSE_REFRESH_SECONDS:
                 new_universe = select_universe()
@@ -1224,10 +1356,10 @@ def analysis_loop():
 
             if universe:
                 for symbol in list(universe):
-                    if stop_event.is_set():
+                    if stop_event.is_set() or is_banned():
                         break
                     process_symbol(symbol)
-                    time.sleep(0.12)
+                    time.sleep(REQUEST_PACING_SECONDS)
                 with state_lock:
                     state["last_analysis"] = time.time()
                 save_state()
@@ -1247,6 +1379,8 @@ def daily_report_loop():
             with state_lock:
                 pending = len(state["pending"])
                 trades = len(state["virtual_trades"])
+                banned = is_banned()
+                ban_restante = int(ban_remaining())
             with market_lock:
                 live_count = sum(1 for x in live_market.values() if time.time() - x.get("last_event", 0) < 10)
             with state_lock:
@@ -1261,6 +1395,7 @@ def daily_report_loop():
                 f"Señales pendientes: {pending}\n"
                 f"Trades virtuales: {trades} (exposición máx: {MAX_TOTAL_EXPOSURE})\n"
                 f"Errores Binance consecutivos: {errors} (último: {last_err})\n"
+                f"Ban activo: {'🚫 sí, faltan ' + str(ban_restante) + 's' if banned else '🟢 no'}\n"
                 "👤 Operación manual: el bot no ejecuta órdenes."
             )
             last_day = key
@@ -1283,6 +1418,8 @@ def health():
         ws_ok = bool(state["ws_connected"])
         last_analysis = state["last_analysis"]
         exposure = len(state["pending"]) + len(state["virtual_trades"])
+        banned = is_banned()
+        banned_until = state.get("banned_until", 0)
     with error_lock:
         errors = consecutive_binance_errors
         last_err = last_binance_error
@@ -1296,6 +1433,9 @@ def health():
         "max_total_exposure": MAX_TOTAL_EXPOSURE,
         "consecutive_binance_errors": errors,
         "last_binance_error": last_err,
+        "binance_banned": banned,
+        "banned_until": utc_iso(banned_until) if banned_until else None,
+        "used_weight_1m_last_seen": last_used_weight,
     })
 
 
@@ -1310,6 +1450,9 @@ def status():
             "last_analysis": utc_iso(state["last_analysis"]) if state["last_analysis"] else None,
             "last_universe": utc_iso(state["last_universe"]) if state["last_universe"] else None,
             "ws_connected": state["ws_connected"],
+            "binance_banned": is_banned(),
+            "banned_until": utc_iso(state["banned_until"]) if state.get("banned_until") else None,
+            "last_ban_reason": state.get("last_ban_reason"),
         }
     with error_lock:
         safe["consecutive_binance_errors"] = consecutive_binance_errors
@@ -1328,11 +1471,15 @@ def diagnostico():
                 "ENTRY_ATR_WIDTH": ENTRY_ATR_WIDTH, "ADX_MIN_5M": ADX_MIN_5M,
                 "VOLUME_MIN_5M": VOLUME_MIN_5M, "SL_PCT": SL_PCT,
                 "TP1_PCT": TP1_PCT, "TP2_PCT": TP2_PCT, "TP3_PCT": TP3_PCT,
+                "MAX_UNIVERSE_CANDIDATES": MAX_UNIVERSE_CANDIDATES,
+                "REQUEST_PACING_SECONDS": REQUEST_PACING_SECONDS,
                 "leverage": 5, "execution": "MANUAL_ONLY"
             },
             "universe": universe,
             "pending": list(state["pending"].keys()),
             "virtual_trades": list(state["virtual_trades"].keys()),
+            "binance_banned": is_banned(),
+            "banned_until": utc_iso(state["banned_until"]) if state.get("banned_until") else None,
         })
 
 
@@ -1355,6 +1502,21 @@ def signal_detail(symbol):
     with market_lock:
         live = live_snapshot(symbol)
     return jsonify({"symbol": symbol, "live": live, "pending": p, "virtual_trade": t})
+
+
+# ------------------------- DESBANEAR MANUAL --------------------
+# Por si Binance ya levantó el ban en los hechos pero el bot todavía
+# tiene guardado un banned_until viejo (por ejemplo, tras cambiar de
+# IP/hosting). Uso: /desbanear?token=...
+@app.route("/desbanear")
+def unban():
+    if not authorized():
+        return "No autorizado", 403
+    with state_lock:
+        state["banned_until"] = 0.0
+        state["last_ban_reason"] = None
+    save_state()
+    return "Ban limpiado manualmente", 200
 
 
 # ------------------------- MANUAL CONFIRMATION --------------
@@ -1452,17 +1614,20 @@ def start_workers():
     if ws_thread and ws_thread.is_alive():
         return
     load_state()
+    banned = is_banned()
     send_telegram(
-        "🤖 BOT FUTUROS PRO ONLINE (v3)\n\n"
+        "🤖 BOT FUTUROS PRO ONLINE (v5)\n\n"
         "📡 Precio en vivo: WebSocket Binance\n"
         "📊 Análisis: 1D / 4H / 1H / 15M / 5M\n"
         "🧠 Señales confirmadas con velas CERRADAS\n"
         f"⏱️ Caducidad señal final: {SIGNAL_TTL_SECONDS//60} min\n"
         f"🎯 SL {SL_PCT:.1f}% | TP1 {TP1_PCT:.1f}% | TP2 {TP2_PCT:.1f}% | TP3 {TP3_PCT:.1f}%\n"
         f"📦 Exposición máxima simultánea: {MAX_TOTAL_EXPOSURE}\n"
-        "🔔 Ahora avisa si Binance falla o bloquea la IP.\n"
+        f"🌐 Universo: hasta {TOTAL_MONEDAS} monedas (analiza como máx. {MAX_UNIVERSE_CANDIDATES} candidatas por volumen)\n"
+        "🔔 Ahora respeta bans de Binance de forma global y persistida (no vuelve a insistir).\n"
         "✅ Confirmar/cancelar con botones en el mensaje de Telegram.\n"
         "👤 SOLO SEÑALES: el bot NO ejecuta órdenes."
+        + ("\n\n🚫 Arranca con un ban de Binance todavía activo, no va a pedir datos hasta que se levante." if banned else "")
     )
 
     ws_thread = threading.Thread(target=websocket_loop, name="binance-ws", daemon=True)
